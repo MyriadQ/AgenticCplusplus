@@ -1,5 +1,6 @@
 add_executable(unit_tests
   smoke_test.cpp
+  test_unique_fd.cpp
   # one file per module, added as it is written:
   # test_line_buffer.cpp
   # test_template_parser.cpp
