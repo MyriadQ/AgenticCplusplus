@@ -7,10 +7,10 @@ add_executable(unit_tests
   test_template_parser.cpp
   test_memory_store.cpp
   test_policy.cpp
+  test_agent.cpp
   # one file per module, added as it is written:
   # test_vectorizer.cpp
   # test_executor.cpp
-  # test_agent.cpp
 )
 
 target_compile_definitions(unit_tests PRIVATE AGENTICPP_SOURCE_DIR="${CMAKE_SOURCE_DIR}")

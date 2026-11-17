@@ -1,0 +1,11 @@
+{
+  "content": "",
+  "finish_reason": "tool_calls",
+  "tool_calls": [
+    {
+      "id": "call_1",
+      "name": "run_command",
+      "arguments_json": "{\"argv\":[\"scripts/kill-decoy.sh\"],\"purpose\":\"free port 8080\"}"
+    }
+  ]
+}
