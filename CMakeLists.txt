@@ -109,6 +109,7 @@ endif()
 # Executables
 # ---------------------------------------------------------------------------
 add_executable(agentd apps/agentd.cpp)
+target_compile_definitions(agentd PRIVATE AGENTICPP_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(agentd PRIVATE agenticpp_core)
 
 # ---------------------------------------------------------------------------
