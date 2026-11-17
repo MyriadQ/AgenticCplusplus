@@ -6,12 +6,14 @@ add_executable(unit_tests
   test_line_buffer.cpp
   test_template_parser.cpp
   test_memory_store.cpp
+  test_policy.cpp
   # one file per module, added as it is written:
-  # test_policy.cpp
   # test_vectorizer.cpp
   # test_executor.cpp
   # test_agent.cpp
 )
+
+target_compile_definitions(unit_tests PRIVATE AGENTICPP_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
 target_link_libraries(unit_tests PRIVATE agenticpp_core)
 target_link_libraries(unit_tests PRIVATE Catch2::Catch2WithMain)
