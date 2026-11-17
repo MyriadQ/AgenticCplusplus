@@ -5,12 +5,10 @@ add_executable(unit_tests
   test_types.cpp
   test_line_buffer.cpp
   test_template_parser.cpp
+  test_memory_store.cpp
   # one file per module, added as it is written:
-  # test_memory_store.cpp
-  # test_template_parser.cpp
-  # test_vectorizer.cpp
-  # test_memory_store.cpp
   # test_policy.cpp
+  # test_vectorizer.cpp
   # test_executor.cpp
   # test_agent.cpp
 )
