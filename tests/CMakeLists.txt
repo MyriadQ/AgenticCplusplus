@@ -4,8 +4,9 @@ add_executable(unit_tests
   test_result.cpp
   test_types.cpp
   test_line_buffer.cpp
+  test_template_parser.cpp
   # one file per module, added as it is written:
-  # test_template_parser.cpp
+  # test_memory_store.cpp
   # test_template_parser.cpp
   # test_vectorizer.cpp
   # test_memory_store.cpp

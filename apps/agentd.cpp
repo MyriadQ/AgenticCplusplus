@@ -1,5 +1,6 @@
 // agentd — the daemon. Stage 1: argument parsing + deterministic replay.
 // Execution and the live tail arrive in later stages.
+#include <algorithm>
 #include <cstdio>
 #include <fstream>
 #include <iterator>
@@ -9,6 +10,7 @@
 #include <string_view>
 
 #include "agenticpp/line_buffer.hpp"
+#include "agenticpp/template_parser.hpp"
 #include "agenticpp/version.hpp"
 
 namespace {
@@ -22,6 +24,7 @@ void print_usage(std::string_view argv0) {
         "  --replay PATH        replay a log file once, from byte 0\n"
         "  --from-start         accepted for compatibility; replay starts at byte 0\n"
         "  --stats              print replay line/dropped/byte counts\n"
+        "  --dump-templates     print each parsed template id and masked text\n"
         "\n"
         "planned:\n"
         "  --config PATH        runtime config (default config/agent.json)\n"
@@ -46,7 +49,7 @@ std::optional<std::string> read_file(const std::string& path) {
     return data;
 }
 
-int replay_file(const std::string& path, bool stats, bool from_start) {
+int replay_file(const std::string& path, bool stats, bool from_start, bool dump_templates) {
     // Stage 1 has no offset tracking. Replay always starts at byte 0; --from-start is
     // accepted now so scripts and tests do not have to change when the live source lands.
     (void)from_start;
@@ -64,7 +67,13 @@ int replay_file(const std::string& path, bool stats, bool from_start) {
     std::size_t lines = 0;
     while (const auto line = buffer.next_line()) {
         ++lines;
-        if (!stats) {
+        if (dump_templates) {
+            const agenticpp::ParsedLine parsed = agenticpp::parse_template(*line);
+            const std::size_t display_size = std::min<std::size_t>(parsed.template_text.size(), 200);
+            std::printf("template=%016llx params=%zu text=\"%.*s\"\n",
+                        static_cast<unsigned long long>(parsed.template_id), parsed.params.size(),
+                        static_cast<int>(display_size), parsed.template_text.data());
+        } else if (!stats) {
             if (line->empty()) {
                 std::printf("\n");
             } else {
@@ -89,6 +98,7 @@ int main(int argc, char** argv) {
     bool has_replay = false;
     bool stats = false;
     bool from_start = false;
+    bool dump_templates = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string_view arg = argv[i];
@@ -119,6 +129,10 @@ int main(int argc, char** argv) {
             from_start = true;
             continue;
         }
+        if (arg == "--dump-templates") {
+            dump_templates = true;
+            continue;
+        }
 
         std::fprintf(stderr, "agentd: unknown option '%.*s'\n", static_cast<int>(arg.size()),
                      arg.data());
@@ -127,11 +141,11 @@ int main(int argc, char** argv) {
     }
 
     if (has_replay) {
-        return replay_file(replay_path, stats, from_start);
+        return replay_file(replay_path, stats, from_start, dump_templates);
     }
 
-    if (stats) {
-        std::fprintf(stderr, "agentd: --stats requires --replay\n");
+    if (stats || dump_templates) {
+        std::fprintf(stderr, "agentd: --stats and --dump-templates require --replay\n");
         return 2;
     }
 
