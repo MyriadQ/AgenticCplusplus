@@ -138,13 +138,21 @@ void Agent::run_incident(std::string_view line) {
     std::vector<std::string> argv;
     std::string purpose;
 
-    if (!hits.empty() && hits.front().record != nullptr) {
+    const bool recall_hit = !hits.empty() && hits.front().record != nullptr &&
+                            hits.front().score >= config_.recall_threshold;
+
+    if (recall_hit) {
         argv = hits.front().record->argv;
         purpose = hits.front().record->purpose;
         transition(Phase::Recall, Phase::Propose,
                    "recall hit score=" + std::to_string(hits.front().score));
     } else {
-        transition(Phase::Recall, Phase::Diagnose, "recall miss");
+        std::string reason = "recall miss";
+        if (!hits.empty()) {
+            reason += " best=" + std::to_string(hits.front().score) + " threshold=" +
+                      std::to_string(config_.recall_threshold);
+        }
+        transition(Phase::Recall, Phase::Diagnose, reason);
 
         std::vector<Message> history;
         Message system_message;
@@ -195,12 +203,19 @@ void Agent::run_incident(std::string_view line) {
     }
     transition(Phase::Authorize, Phase::Act, "allow rule=" + verdict.rule_id);
 
+    if (!verdict.resolved_program.empty()) {
+        argv[0] = verdict.resolved_program.string();
+    }
+
     const ExecResult result = runner_.run(argv);
+    const std::string command_detail = "exit=" + std::to_string(result.exit_code) +
+                                       (result.timed_out ? " timed_out" : "") +
+                                       (result.err.empty() ? "" : " err=" + result.err.substr(0, 200));
     if (result.exit_code != 0 || result.timed_out) {
-        transition(Phase::Act, Phase::Cooldown, "command failed");
+        transition(Phase::Act, Phase::Cooldown, "command failed " + command_detail);
         return;
     }
-    transition(Phase::Act, Phase::Verify, "verify recovery");
+    transition(Phase::Act, Phase::Verify, "command " + command_detail);
 
     const Verdict verification = verifier_.verify(parsed.template_id);
     if (!verification.ok) {

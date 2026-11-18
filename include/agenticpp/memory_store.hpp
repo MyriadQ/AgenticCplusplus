@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "agenticpp/types.hpp"
+#include "agenticpp/vectorizer.hpp"
 
 namespace agenticpp {
 
@@ -32,8 +33,12 @@ class MemoryStore {
 public:
     static constexpr std::size_t kDefaultTopK = 3;
 
+    MemoryStore();
+    explicit MemoryStore(std::size_t reserve);
+    explicit MemoryStore(const Vectorizer& vectorizer, std::size_t reserve = 1024);
+
     // The caller supplies the template id (normally ParsedLine::template_id).
-    // Stage 1 is exact-match only; Stage 2 replaces the internals with vector search.
+    // The vector is recomputed from text; Stage 3 adds durable journaling.
     void upsert(std::uint64_t id, std::string_view text, FixRecord record);
     void record_outcome(std::uint64_t id, bool success);
 
@@ -42,7 +47,11 @@ public:
     [[nodiscard]] std::size_t size() const noexcept;
 
 private:
+    Vectorizer vectorizer_;
     std::unordered_map<std::uint64_t, FixRecord> records_;
+    std::vector<std::uint64_t> ids_;
+    std::vector<float> vectors_;
+    std::unordered_map<std::uint64_t, std::size_t> row_by_id_;
 };
 
 }  // namespace agenticpp

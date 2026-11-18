@@ -53,12 +53,12 @@
     "rlimits": {
       "cpu_seconds": 10,
       "address_space_bytes": 536870912,
-      "nproc": 64,
+      "nproc": 4096,
       "fsize_bytes": 1048576
     }
   },
   "verifier": {
-    "health_url": "http://127.0.0.1:8080/health",
+    "health_url": "http://127.0.0.1:18080/health",
     "health_timeout_ms": 5000,
     "log_quiet_window_ms": 3000
   },
@@ -73,7 +73,7 @@
       "id": "kill-decoy",
       "program": "scripts/kill-decoy.sh",
       "max_args": 0,
-      "doc": "Stop the process that is occupying the victim's port. Use when the log says 'address already in use'."
+      "doc": "Free the victim's port and restart the victim. Use when the log says 'address already in use'."
     },
     {
       "id": "fix-config",

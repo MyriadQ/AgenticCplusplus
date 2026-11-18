@@ -58,6 +58,7 @@ TEST_CASE("AgentConfig: budgets have safe defaults") {
     REQUIRE(config.max_tool_calls == 4);
     REQUIRE(config.max_llm_round_trips == 3);
     REQUIRE(config.max_concurrent_incidents == 2);
+    REQUIRE(config.recall_threshold == 0.86f);
     REQUIRE(config.dedup_window == std::chrono::seconds{60});
     REQUIRE(config.cooldown_max == std::chrono::seconds{1800});
 }

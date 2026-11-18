@@ -101,7 +101,7 @@ TEST_CASE("Agent: miss calls LLM and learns") {
     const auto parsed = agenticpp::parse_template(kIncident);
     const auto hits = memory.search(parsed.template_text);
     REQUIRE(hits.size() == 1);
-    REQUIRE(hits.front().record->argv.front() == "scripts/kill-decoy.sh");
+    REQUIRE(hits.front().record->argv.front().ends_with("scripts/kill-decoy.sh"));
     REQUIRE_FALSE(sink.events.empty());
 }
 
@@ -131,6 +131,33 @@ TEST_CASE("Agent: recall hit skips the LLM") {
 
     const auto phases = visited_phases(agent);
     REQUIRE(std::find(phases.begin(), phases.end(), agenticpp::Phase::Diagnose) == phases.end());
+}
+
+TEST_CASE("Agent: low-score recall is treated as a miss") {
+    auto policy = load_policy();
+    REQUIRE(policy.has_value());
+
+    agenticpp::MemoryStore memory;
+    agenticpp::FixRecord unrelated;
+    unrelated.argv = {"scripts/fix-config.sh"};
+    unrelated.purpose = "unrelated known fix";
+    memory.upsert(agenticpp::fnv1a64("parse config: unexpected token"),
+                  "parse config: unexpected token", unrelated);
+
+    agenticpp::FakeLlmClient llm;
+    llm.reply = make_reply({"scripts/kill-decoy.sh"}, "free port 8080");
+    agenticpp::DryRunRunner runner;
+    agenticpp::AlwaysOkVerifier verifier;
+    agenticpp::RecordingSink sink;
+    agenticpp::AgentConfig config;
+
+    agenticpp::Agent agent(config, memory, llm, policy.value(), runner, verifier, sink);
+    agent.on_line(kIncident);
+    agent.run_once();
+
+    REQUIRE(llm.calls == 1);
+    REQUIRE(memory.size() == 2);
+    REQUIRE(agent.trail().front().to == agenticpp::Phase::Detect);
 }
 
 TEST_CASE("Agent: denied argv never reaches the runner") {

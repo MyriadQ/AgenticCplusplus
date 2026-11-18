@@ -110,7 +110,7 @@ struct ExecLimits {
     std::size_t output_cap = 64 * 1024;
     int cpu_seconds = 10;
     std::uint64_t address_space = 512ull << 20;
-    int nproc = 64;
+    int nproc = 4096;
     std::uint64_t fsize = 1ull << 20;
 };
 
@@ -151,6 +151,7 @@ struct AgentConfig {
     std::size_t max_tool_calls = 4;
     std::size_t max_llm_round_trips = 3;
     std::size_t max_concurrent_incidents = 2;
+    float recall_threshold = 0.86f;
     std::chrono::seconds dedup_window{60};
     std::chrono::seconds cooldown_initial{60};
     std::chrono::seconds cooldown_max{1800};

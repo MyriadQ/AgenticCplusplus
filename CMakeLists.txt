@@ -112,6 +112,16 @@ add_executable(agentd apps/agentd.cpp)
 target_compile_definitions(agentd PRIVATE AGENTICPP_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(agentd PRIVATE agenticpp_core)
 
+add_executable(victim apps/victim.cpp)
+target_link_libraries(victim PRIVATE agenticpp_core)
+# The executor confines children with RLIMIT_AS=512 MiB. ASan reserves a huge
+# virtual shadow range, so the demo victim must stay unsanitized. The agent and
+# core library remain ASan/UBSan builds.
+if(AGENTICPP_SANITIZE)
+  target_compile_options(victim PRIVATE -fno-sanitize=address,undefined)
+  target_link_options(victim PRIVATE -fno-sanitize=address,undefined)
+endif()
+
 # ---------------------------------------------------------------------------
 # Tests (ctest)
 # ---------------------------------------------------------------------------

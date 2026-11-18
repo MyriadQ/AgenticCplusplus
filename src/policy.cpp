@@ -1,7 +1,11 @@
 #include "agenticpp/policy.hpp"
 
+#include <exception>
+#include <filesystem>
 #include <fstream>
+#include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 
 #include <nlohmann/json.hpp>
@@ -9,14 +13,28 @@
 namespace agenticpp {
 namespace {
 
+namespace fs = std::filesystem;
+
 PolicyVerdict deny(std::string rule_id, std::string reason) {
-    return PolicyVerdict{Decision::Deny, std::move(rule_id), std::move(reason)};
+    return PolicyVerdict{Decision::Deny, std::move(rule_id), std::move(reason), {}};
+}
+
+bool is_within(const fs::path& path, const fs::path& root) {
+    std::error_code error;
+    const fs::path relative = fs::relative(path, root, error);
+    if (error || relative.empty()) {
+        return false;
+    }
+    return relative.native().rfind("..", 0) != 0;
+}
+
+fs::path resolve(const fs::path& path, std::error_code& error) {
+    return fs::weakly_canonical(path, error);
 }
 
 }  // namespace
 
-Result<Policy> Policy::from_file(const std::filesystem::path& config_path,
-                                 const std::filesystem::path& root) {
+Result<Policy> Policy::from_file(const fs::path& config_path, const fs::path& root) {
     std::ifstream input(config_path);
     if (!input) {
         return Result<Policy>::err(1, "cannot open policy config: " + config_path.string());
@@ -34,11 +52,21 @@ Result<Policy> Policy::from_file(const std::filesystem::path& config_path,
     }
 
     Policy policy;
-    policy.root_ = root;
+
+    std::error_code error;
+    fs::path canonical_root = fs::weakly_canonical(root, error);
+    if (error) {
+        error.clear();
+        canonical_root = fs::absolute(root, error);
+        if (error) {
+            return Result<Policy>::err(4, "cannot resolve project root: " + root.string());
+        }
+    }
+    policy.root_ = std::move(canonical_root);
 
     for (const auto& item : config["allow"]) {
         if (!item.is_object()) {
-            return Result<Policy>::err(4, "each allow entry must be an object");
+            return Result<Policy>::err(5, "each allow entry must be an object");
         }
 
         Rule rule;
@@ -48,19 +76,35 @@ Result<Policy> Policy::from_file(const std::filesystem::path& config_path,
 
         const int max_args = item.value("max_args", 0);
         if (rule.id.empty() || rule.program.empty() || max_args < 0) {
-            return Result<Policy>::err(5, "allow entry needs id, program, and max_args >= 0");
+            return Result<Policy>::err(6, "allow entry needs id, program, and max_args >= 0");
         }
         rule.max_args = static_cast<std::size_t>(max_args);
+
+        fs::path program_path{rule.program};
+        if (!program_path.is_absolute()) {
+            program_path = policy.root_ / program_path;
+        }
+
+        error.clear();
+        const fs::path resolved_program = resolve(program_path, error);
+        if (error) {
+            return Result<Policy>::err(7, "cannot resolve allow entry: " + rule.program);
+        }
+        if (!is_within(resolved_program, policy.root_)) {
+            return Result<Policy>::err(8, "allow entry escapes project root: " + rule.program);
+        }
+
+        policy.resolved_programs_.push_back(resolved_program);
         policy.rules_.push_back(std::move(rule));
     }
 
     if (config.contains("deny_programs")) {
         if (!config["deny_programs"].is_array()) {
-            return Result<Policy>::err(6, "deny_programs must be an array");
+            return Result<Policy>::err(9, "deny_programs must be an array");
         }
         for (const auto& item : config["deny_programs"]) {
             if (!item.is_string()) {
-                return Result<Policy>::err(7, "deny_programs entries must be strings");
+                return Result<Policy>::err(10, "deny_programs entries must be strings");
             }
             policy.deny_programs_.push_back(item.get<std::string>());
         }
@@ -102,14 +146,47 @@ PolicyVerdict Policy::check(const std::vector<std::string>& argv) const {
         return deny("", "program must be an explicit path");
     }
 
-    for (const Rule& rule : rules_) {
-        if (rule.program != program) {
+    std::filesystem::path candidate{program};
+    if (!candidate.is_absolute()) {
+        candidate = root_ / candidate;
+    }
+
+    std::error_code error;
+    const std::filesystem::file_status status = std::filesystem::symlink_status(candidate, error);
+    if (!error && std::filesystem::is_symlink(status)) {
+        return deny("", "program path is a symlink");
+    }
+
+    error.clear();
+    const std::filesystem::path resolved_program = resolve(candidate, error);
+    if (error) {
+        return deny("", "cannot resolve program path: " + program);
+    }
+    if (!is_within(resolved_program, root_)) {
+        return deny("", "program is outside the project root: " + program);
+    }
+
+    for (std::size_t i = 1; i < argv.size(); ++i) {
+        const std::string& arg = argv[i];
+        if (arg.empty() || arg.front() != '/') {
             continue;
         }
-        if (argv.size() - 1 > rule.max_args) {
-            return deny(rule.id, "too many arguments");
+        error.clear();
+        const std::filesystem::path resolved_arg = resolve(arg, error);
+        if (error || !is_within(resolved_arg, root_ / "data")) {
+            return deny("", "absolute argument is outside data/: " + arg);
         }
-        return PolicyVerdict{Decision::Allow, rule.id, "exact allowlist match"};
+    }
+
+    for (std::size_t i = 0; i < rules_.size(); ++i) {
+        if (resolved_programs_[i] != resolved_program) {
+            continue;
+        }
+        if (argv.size() - 1 > rules_[i].max_args) {
+            return deny(rules_[i].id, "too many arguments");
+        }
+        return PolicyVerdict{Decision::Allow, rules_[i].id, "resolved allowlist match",
+                              resolved_program};
     }
 
     return deny("", "program not allowlisted");

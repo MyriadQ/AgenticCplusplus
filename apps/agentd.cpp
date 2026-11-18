@@ -1,5 +1,4 @@
-// agentd — the daemon. Stage 1: argument parsing + deterministic replay.
-// Execution and the live tail arrive in later stages.
+// agentd — replay-driven repair agent with a bounded phase machine.
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -7,6 +6,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -17,6 +17,7 @@
 #include <nlohmann/json.hpp>
 
 #include "agenticpp/agent.hpp"
+#include "agenticpp/config.hpp"
 #include "agenticpp/event_sink.hpp"
 #include "agenticpp/executor.hpp"
 #include "agenticpp/line_buffer.hpp"
@@ -27,30 +28,36 @@
 #include "agenticpp/verifier.hpp"
 #include "agenticpp/version.hpp"
 
+#if AGENTICPP_ENABLE_LLM
+#include "agenticpp/deepseek_client.hpp"
+#endif
+
 namespace {
+
+namespace fs = std::filesystem;
 
 void print_usage(std::string_view argv0) {
     std::printf(
         "usage: %.*s [options]\n"
         "\n"
-        "  --version            print build info and exit\n"
-        "  --help               print this help and exit\n"
-        "  --replay PATH        replay a log file once, from byte 0\n"
-        "  --from-start         accepted for compatibility; replay starts at byte 0\n"
-        "  --stats              print replay line/dropped/byte counts\n"
-        "  --dump-templates     print each parsed template id and masked text\n"
-        "  --seed-fix TEXT PROGRAM  seed an in-memory fix for a dev probe\n"
-        "  --recall TEXT        query the in-memory exact-match store\n"
-        "  --check-command ...  check an argv vector against config/agent.json\n"
-        "  --dry-run            run the Agent loop on replay (no execution)\n"
-        "  --llm=cassette       use a recorded ChatReply for --dry-run\n"
-        "  --cassette PATH      cassette file for --dry-run\n"
-        "\n"
-        "planned:\n"
-        "  --config PATH        runtime config (default config/agent.json)\n"
-        "  --execute            allow the policy gate to run commands\n"
-        "  --yes                with --execute: unattended, no per-command confirmation\n"
-        "  --no-llm             deterministic path only\n",
+        "  --version                 print build info and exit\n"
+        "  --help                    print this help and exit\n"
+        "  --config PATH             runtime config (default config/agent.json)\n"
+        "  --replay PATH             replay a log file once, from byte 0\n"
+        "  --from-start              accepted for compatibility; replay starts at byte 0\n"
+        "  --stats                   print replay line/dropped/byte counts\n"
+        "  --dump-templates          print each parsed template id and masked text\n"
+        "  --dry-run                 run the Agent loop without execution (default for Agent mode)\n"
+        "  --execute                 allow the policy gate to run commands (requires --yes)\n"
+        "  --yes                     unattended confirmation for --execute\n"
+        "  --no-llm                  deterministic recall only\n"
+        "  --llm=cassette            use a recorded ChatReply\n"
+        "  --cassette PATH           cassette file for --llm=cassette\n"
+        "  --llm=deepseek            use the real DeepSeek transport\n"
+        "  --llm-smoke               warm up the configured real LLM and exit\n"
+        "  --seed-fix TEXT PROGRAM   seed an in-memory fix for a dev probe\n"
+        "  --recall TEXT             query the in-memory store\n"
+        "  --check-command ...       check an argv vector against the allowlist\n",
         static_cast<int>(argv0.size()), argv0.data());
 }
 
@@ -68,19 +75,27 @@ std::optional<std::string> read_file(const std::string& path) {
     return data;
 }
 
-std::filesystem::path project_root() {
-    std::filesystem::path root = std::filesystem::current_path();
-    if (!std::filesystem::exists(root / "config/agent.json")) {
+fs::path project_root() {
+    fs::path root = fs::current_path();
+    if (!fs::exists(root / "config/agent.json")) {
 #ifdef AGENTICPP_SOURCE_DIR
-        root = std::filesystem::path{AGENTICPP_SOURCE_DIR};
+        root = fs::path{AGENTICPP_SOURCE_DIR};
 #endif
     }
     return root;
 }
 
-agenticpp::Result<agenticpp::Policy> load_policy() {
-    const std::filesystem::path root = project_root();
-    return agenticpp::Policy::from_file(root / "config/agent.json", root);
+fs::path resolve_config_path(const std::string& path) {
+    const fs::path candidate{path};
+    if (candidate.is_absolute()) {
+        return candidate;
+    }
+    return project_root() / candidate;
+}
+
+agenticpp::Result<agenticpp::Policy> load_policy(const std::string& config_path) {
+    const fs::path root = project_root();
+    return agenticpp::Policy::from_file(resolve_config_path(config_path), root);
 }
 
 class CassetteLlmClient final : public agenticpp::LlmClient {
@@ -88,12 +103,12 @@ public:
     explicit CassetteLlmClient(std::string path) : path_(std::move(path)) {}
 
     agenticpp::Result<agenticpp::ChatReply> chat(std::span<const agenticpp::Message>,
-                                                 std::span<const agenticpp::ToolDef>,
-                                                 const agenticpp::ChatOptions&) override {
+                                                  std::span<const agenticpp::ToolDef>,
+                                                  const agenticpp::ChatOptions&) override {
         const auto data = read_file(path_);
         if (!data.has_value()) {
-            return agenticpp::Result<agenticpp::ChatReply>::err(
-                1, "cannot read cassette: " + path_);
+            return agenticpp::Result<agenticpp::ChatReply>::err(1,
+                                                                "cannot read cassette: " + path_);
         }
 
         try {
@@ -124,44 +139,16 @@ private:
     std::string path_;
 };
 
-int run_agent_replay(const std::string& path, const std::string& cassette_path, bool stats) {
-    const auto data = read_file(path);
-    if (!data.has_value()) {
-        std::fprintf(stderr, "agentd: cannot read '%s'\n", path.c_str());
-        return 2;
+class NoLlmClient final : public agenticpp::LlmClient {
+public:
+    agenticpp::Result<agenticpp::ChatReply> chat(std::span<const agenticpp::Message>,
+                                                  std::span<const agenticpp::ToolDef>,
+                                                  const agenticpp::ChatOptions&) override {
+        return agenticpp::Result<agenticpp::ChatReply>::err(503, "LLM is disabled");
     }
 
-    auto policy = load_policy();
-    if (!policy.has_value()) {
-        std::fprintf(stderr, "agentd: policy error: %s\n", policy.error().message.c_str());
-        return 2;
-    }
-
-    CassetteLlmClient llm(cassette_path);
-    agenticpp::MemoryStore memory;
-    agenticpp::DryRunRunner runner;
-    agenticpp::AlwaysOkVerifier verifier;
-    agenticpp::ConsoleSink sink;
-    agenticpp::AgentConfig config;
-    agenticpp::Agent agent(config, memory, llm, policy.value(), runner, verifier, sink);
-
-    agenticpp::LineBuffer buffer;
-    buffer.append(std::span<const char>(data->data(), data->size()));
-    buffer.flush_eof();
-
-    std::size_t lines = 0;
-    while (const auto line = buffer.next_line()) {
-        ++lines;
-        agent.on_line(*line);
-        agent.run_once();
-    }
-
-    if (stats) {
-        std::printf("replay: lines=%zu dropped=%zu bytes=%zu\n", lines, buffer.dropped_lines(),
-                    data->size());
-    }
-    return 0;
-}
+    agenticpp::Result<void> warmup() override { return agenticpp::Result<void>::ok(); }
+};
 
 int memory_demo(bool has_seed, const std::string& seed_text, const std::string& seed_program,
                 bool has_recall, const std::string& recall_query) {
@@ -195,11 +182,7 @@ int memory_demo(bool has_seed, const std::string& seed_text, const std::string& 
     return 0;
 }
 
-int replay_file(const std::string& path, bool stats, bool from_start, bool dump_templates) {
-    // Stage 1 has no offset tracking. Replay always starts at byte 0; --from-start is
-    // accepted now so scripts and tests do not have to change when the live source lands.
-    (void)from_start;
-
+int replay_file(const std::string& path, bool stats, bool dump_templates) {
     const auto data = read_file(path);
     if (!data.has_value()) {
         std::fprintf(stderr, "agentd: cannot read '%s'\n", path.c_str());
@@ -235,16 +218,154 @@ int replay_file(const std::string& path, bool stats, bool from_start, bool dump_
     return 0;
 }
 
+int run_agent_replay(const std::string& replay_path, const std::string& config_path, bool execute,
+                     bool stats, const std::string& llm_mode, const std::string& cassette_path) {
+    const auto data = read_file(replay_path);
+    if (!data.has_value()) {
+        std::fprintf(stderr, "agentd: cannot read '%s'\n", replay_path.c_str());
+        return 2;
+    }
+
+    if (execute && fs::exists(project_root() / "data/STOP")) {
+        std::fprintf(stderr, "agentd: data/STOP exists; refusing to execute\n");
+        return 2;
+    }
+
+    auto config = agenticpp::load_config(resolve_config_path(config_path));
+    if (!config.has_value()) {
+        std::fprintf(stderr, "agentd: config error: %s\n", config.error().message.c_str());
+        return 2;
+    }
+
+    auto policy = load_policy(config_path);
+    if (!policy.has_value()) {
+        std::fprintf(stderr, "agentd: policy error: %s\n", policy.error().message.c_str());
+        return 2;
+    }
+
+    std::unique_ptr<agenticpp::LlmClient> llm;
+    if (llm_mode == "cassette") {
+        if (cassette_path.empty()) {
+            std::fprintf(stderr, "agentd: cassette mode requires a path\n");
+            return 2;
+        }
+        llm = std::make_unique<CassetteLlmClient>(cassette_path);
+    } else if (llm_mode == "none") {
+        llm = std::make_unique<NoLlmClient>();
+    } else if (llm_mode == "deepseek") {
+#if AGENTICPP_ENABLE_LLM
+        auto client = std::make_unique<agenticpp::DeepSeekClient>(config.value().llm);
+        auto warm = client->warmup();
+        if (!warm.has_value()) {
+            std::fprintf(stderr, "agentd: LLM warmup failed: %s\n", warm.error().message.c_str());
+            return 2;
+        }
+        std::printf("agentd: llm warmup ok\n");
+        llm = std::move(client);
+#else
+        std::fprintf(stderr, "agentd: LLM support was not built (AGENTICPP_ENABLE_LLM=0)\n");
+        return 2;
+#endif
+    } else {
+        std::fprintf(stderr, "agentd: unknown LLM mode '%s'\n", llm_mode.c_str());
+        return 2;
+    }
+
+    std::unique_ptr<agenticpp::CommandRunner> runner;
+    if (execute) {
+        runner = std::make_unique<agenticpp::ChildProcessRunner>(config.value().executor);
+    } else {
+        runner = std::make_unique<agenticpp::DryRunRunner>();
+    }
+
+    std::unique_ptr<agenticpp::Verifier> verifier;
+    if (execute) {
+        verifier = std::make_unique<agenticpp::HealthProbeVerifier>(config.value().verifier);
+    } else {
+        verifier = std::make_unique<agenticpp::AlwaysOkVerifier>();
+    }
+
+    agenticpp::ConsoleSink console;
+    agenticpp::JsonlSink jsonl(project_root() / "data/audit.log");
+    agenticpp::TeeSink sink(console, jsonl);
+    agenticpp::MemoryStore memory;
+    agenticpp::Agent agent(config.value().agent, memory, *llm, policy.value(), *runner,
+                           *verifier, sink);
+
+    agenticpp::LineBuffer buffer;
+    buffer.append(std::span<const char>(data->data(), data->size()));
+    buffer.flush_eof();
+
+    std::size_t lines = 0;
+    while (const auto line = buffer.next_line()) {
+        ++lines;
+        agent.on_line(*line);
+        agent.run_once();
+    }
+
+    if (stats) {
+        std::printf("replay: lines=%zu dropped=%zu bytes=%zu\n", lines, buffer.dropped_lines(),
+                    data->size());
+    }
+    return 0;
+}
+
+int check_command_argv(const std::vector<std::string>& command, const std::string& config_path) {
+    if (command.empty()) {
+        std::fprintf(stderr, "agentd: --check-command requires an argv vector\n");
+        return 2;
+    }
+
+    auto policy = load_policy(config_path);
+    if (!policy.has_value()) {
+        std::fprintf(stderr, "agentd: policy error: %s\n", policy.error().message.c_str());
+        return 2;
+    }
+
+    const agenticpp::PolicyVerdict verdict = policy.value().check(command);
+    const bool allowed = verdict.decision == agenticpp::Decision::Allow;
+    std::printf("%s rule=%s reason=%s\n", allowed ? "ALLOW" : "DENY", verdict.rule_id.c_str(),
+                verdict.reason.c_str());
+    return allowed ? 0 : 1;
+}
+
+int run_llm_smoke(const std::string& config_path) {
+#if AGENTICPP_ENABLE_LLM
+    auto config = agenticpp::load_config(resolve_config_path(config_path));
+    if (!config.has_value()) {
+        std::fprintf(stderr, "agentd: config error: %s\n", config.error().message.c_str());
+        return 2;
+    }
+
+    agenticpp::DeepSeekClient client(config.value().llm);
+    auto warm = client.warmup();
+    if (!warm.has_value()) {
+        std::fprintf(stderr, "agentd: LLM warmup failed: %s\n", warm.error().message.c_str());
+        return 1;
+    }
+    std::printf("agentd: llm warmup ok\n");
+    return 0;
+#else
+    (void)config_path;
+    std::fprintf(stderr, "agentd: LLM support was not built (AGENTICPP_ENABLE_LLM=0)\n");
+    return 2;
+#endif
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     std::string_view self = (argc > 0 && argv[0] != nullptr) ? argv[0] : "agentd";
 
+    std::string config_path = "config/agent.json";
     std::string replay_path;
     bool has_replay = false;
     bool stats = false;
-    bool from_start = false;
     bool dump_templates = false;
+    bool dry_run = false;
+    bool execute = false;
+    bool yes = false;
+    bool llm_smoke = false;
     bool has_seed = false;
     bool has_recall = false;
     std::string seed_text;
@@ -252,12 +373,11 @@ int main(int argc, char** argv) {
     std::string recall_query;
     bool has_check_command = false;
     std::vector<std::string> check_command;
-    bool dry_run = false;
-    std::string llm_mode;
+    std::string llm_mode = "none";
     std::string cassette_path;
 
     for (int i = 1; i < argc; ++i) {
-        std::string_view arg = argv[i];
+        const std::string_view arg = argv[i];
 
         if (arg == "--version") {
             std::printf("%.*s\n", static_cast<int>(agenticpp::build_info().size()),
@@ -267,6 +387,14 @@ int main(int argc, char** argv) {
         if (arg == "--help" || arg == "-h") {
             print_usage(self);
             return 0;
+        }
+        if (arg == "--config") {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "agentd: --config requires a path\n");
+                return 2;
+            }
+            config_path = argv[++i];
+            continue;
         }
         if (arg == "--replay") {
             if (i + 1 >= argc) {
@@ -281,12 +409,55 @@ int main(int argc, char** argv) {
             stats = true;
             continue;
         }
-        if (arg == "--from-start") {
-            from_start = true;
-            continue;
-        }
         if (arg == "--dump-templates") {
             dump_templates = true;
+            continue;
+        }
+        if (arg == "--from-start") {
+            continue;
+        }
+        if (arg == "--dry-run") {
+            dry_run = true;
+            continue;
+        }
+        if (arg == "--execute") {
+            execute = true;
+            continue;
+        }
+        if (arg == "--yes") {
+            yes = true;
+            continue;
+        }
+        if (arg == "--no-llm") {
+            llm_mode = "none";
+            continue;
+        }
+        if (arg == "--llm=cassette") {
+            llm_mode = "cassette";
+            continue;
+        }
+        if (arg == "--llm=deepseek") {
+            llm_mode = "deepseek";
+            continue;
+        }
+        if (arg == "--llm") {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "agentd: --llm requires a mode\n");
+                return 2;
+            }
+            llm_mode = argv[++i];
+            continue;
+        }
+        if (arg == "--cassette") {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "agentd: --cassette requires a path\n");
+                return 2;
+            }
+            cassette_path = argv[++i];
+            continue;
+        }
+        if (arg == "--llm-smoke") {
+            llm_smoke = true;
             continue;
         }
         if (arg == "--seed-fix") {
@@ -319,30 +490,6 @@ int main(int argc, char** argv) {
             }
             break;
         }
-        if (arg == "--dry-run") {
-            dry_run = true;
-            continue;
-        }
-        if (arg == "--llm=cassette") {
-            llm_mode = "cassette";
-            continue;
-        }
-        if (arg == "--llm") {
-            if (i + 1 >= argc) {
-                std::fprintf(stderr, "agentd: --llm requires a mode\n");
-                return 2;
-            }
-            llm_mode = argv[++i];
-            continue;
-        }
-        if (arg == "--cassette") {
-            if (i + 1 >= argc) {
-                std::fprintf(stderr, "agentd: --cassette requires a path\n");
-                return 2;
-            }
-            cassette_path = argv[++i];
-            continue;
-        }
         if (!arg.starts_with("--") && llm_mode == "cassette" && cassette_path.empty()) {
             cassette_path = arg;
             continue;
@@ -355,47 +502,46 @@ int main(int argc, char** argv) {
     }
 
     if (has_check_command) {
-        if (check_command.empty()) {
-            std::fprintf(stderr, "agentd: --check-command requires an argv vector\n");
-            return 2;
-        }
+        return check_command_argv(check_command, config_path);
+    }
 
-        auto policy = load_policy();
-        if (!policy.has_value()) {
-            std::fprintf(stderr, "agentd: policy error: %s\n", policy.error().message.c_str());
-            return 2;
-        }
-
-        const agenticpp::PolicyVerdict verdict = policy.value().check(check_command);
-        const bool allowed = verdict.decision == agenticpp::Decision::Allow;
-        std::printf("%s rule=%s reason=%s\n", allowed ? "ALLOW" : "DENY",
-                    verdict.rule_id.c_str(), verdict.reason.c_str());
-        return allowed ? 0 : 1;
+    if (llm_smoke) {
+        return run_llm_smoke(config_path);
     }
 
     if (has_seed || has_recall) {
-        const int result = memory_demo(has_seed, seed_text, seed_program, has_recall, recall_query);
-        if (result != 0 || !has_replay) {
-            return result;
+        if (has_replay || dry_run || execute || llm_smoke) {
+            std::fprintf(stderr, "agentd: memory probe flags cannot be combined with replay\n");
+            return 2;
         }
+        return memory_demo(has_seed, seed_text, seed_program, has_recall, recall_query);
     }
 
-    if (has_replay) {
-        if (dry_run) {
-            if (llm_mode != "cassette" || cassette_path.empty()) {
-                std::fprintf(stderr, "agentd: --dry-run requires --llm=cassette PATH\n");
-                return 2;
-            }
-            return run_agent_replay(replay_path, cassette_path, stats);
-        }
-        return replay_file(replay_path, stats, from_start, dump_templates);
+    if (dry_run && execute) {
+        std::fprintf(stderr, "agentd: --dry-run and --execute are mutually exclusive\n");
+        return 2;
     }
-
-    if (dry_run) {
-        std::fprintf(stderr, "agentd: --dry-run requires --replay\n");
+    if (execute && !yes) {
+        std::fprintf(stderr, "agentd: --execute requires --yes\n");
+        return 2;
+    }
+    if (yes && !execute) {
+        std::fprintf(stderr, "agentd: --yes only makes sense with --execute\n");
         return 2;
     }
 
+    if (has_replay) {
+        if (dry_run || execute) {
+            return run_agent_replay(replay_path, config_path, execute, stats, llm_mode,
+                                    cassette_path);
+        }
+        return replay_file(replay_path, stats, dump_templates);
+    }
+
+    if (dry_run || execute) {
+        std::fprintf(stderr, "agentd: --dry-run/--execute require --replay\n");
+        return 2;
+    }
     if (stats || dump_templates) {
         std::fprintf(stderr, "agentd: --stats and --dump-templates require --replay\n");
         return 2;
@@ -403,6 +549,6 @@ int main(int argc, char** argv) {
 
     std::printf("%.*s\n", static_cast<int>(agenticpp::build_info().size()),
                 agenticpp::build_info().data());
-    std::fprintf(stderr, "agentd: not implemented yet (see docs/WORKER_PLAN.md)\n");
+    std::fprintf(stderr, "agentd: no action selected (see --help)\n");
     return 1;
 }
