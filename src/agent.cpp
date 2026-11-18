@@ -41,6 +41,21 @@ std::string display_template(std::string_view text) {
     return std::string{text.substr(0, 200)};
 }
 
+std::string build_system_prompt(const Policy& policy) {
+    std::string prompt =
+        "You are a bounded log-repair agent. Choose exactly one allowlisted program via the "
+        "run_command tool. Never use a shell, diagnostics, or any program not listed.\n"
+        "Allowed programs:\n";
+    for (const Rule& rule : policy.rules()) {
+        prompt += "- " + rule.program + " (id=" + rule.id +
+                  ", max_args=" + std::to_string(rule.max_args) + "): " + rule.doc + "\n";
+    }
+    prompt +=
+        "Pick the program whose description matches the incident. argv[0] must be the listed "
+        "program path; add at most max_args arguments.";
+    return prompt;
+}
+
 std::string join_argv(const std::vector<std::string>& argv) {
     std::string text = "[";
     for (std::size_t i = 0; i < argv.size(); ++i) {
@@ -157,9 +172,7 @@ void Agent::run_incident(std::string_view line) {
         std::vector<Message> history;
         Message system_message;
         system_message.role = "system";
-        system_message.content =
-            "You are a bounded log-repair agent. Choose one allowlisted program via the "
-            "run_command tool. Never use a shell.";
+        system_message.content = build_system_prompt(policy_);
         history.push_back(std::move(system_message));
 
         Message user_message;
