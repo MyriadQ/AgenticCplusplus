@@ -40,7 +40,8 @@
     "incident_dedup_window_s": 60,
     "cooldown_initial_s": 60,
     "cooldown_max_s": 1800,
-    "max_concurrent_incidents": 2
+    "max_concurrent_incidents": 2,
+    "max_repair_attempts": 2
   },
   "executor": {
     "timeout_ms": 30000,
@@ -50,7 +51,11 @@
       "PATH",
       "HOME",
       "LANG",
-      "LC_ALL"
+      "LC_ALL",
+      "VICTIM_PORT",
+      "VICTIM_LOG",
+      "RUN_DIR",
+      "VICTIM"
     ],
     "rlimits": {
       "cpu_seconds": 10,

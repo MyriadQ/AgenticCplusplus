@@ -5,10 +5,12 @@
 #include <string_view>
 #include <vector>
 
+#include "agenticpp/cooldown.hpp"
 #include "agenticpp/executor.hpp"
 #include "agenticpp/llm_client.hpp"
 #include "agenticpp/memory_store.hpp"
 #include "agenticpp/policy.hpp"
+#include "agenticpp/skills.hpp"
 #include "agenticpp/types.hpp"
 #include "agenticpp/verifier.hpp"
 
@@ -19,7 +21,8 @@ namespace agenticpp {
 class Agent {
 public:
     Agent(AgentConfig config, MemoryStore& memory, LlmClient& llm, Policy& policy,
-          CommandRunner& runner, Verifier& verifier, EventSink& sink);
+          CommandRunner& runner, Verifier& verifier, EventSink& sink,
+          CooldownTable* cooldown = nullptr, SkillRegistry* skills = nullptr);
 
     // Copies an actionable line; run_once() then executes one incident, blocking.
     void on_line(std::string_view line);
@@ -38,6 +41,8 @@ private:
     CommandRunner& runner_;
     Verifier& verifier_;
     EventSink& sink_;
+    CooldownTable* cooldown_;
+    SkillRegistry* skills_;
 
     std::optional<std::string> pending_line_;
     std::vector<Transition> trail_;

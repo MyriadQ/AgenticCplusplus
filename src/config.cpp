@@ -107,6 +107,11 @@ Result<AppConfig> load_config(const std::filesystem::path& path) {
             "max_tool_calls_per_incident", static_cast<int>(config.agent.max_tool_calls)));
         config.agent.max_llm_round_trips = static_cast<std::size_t>(guards.value(
             "max_llm_round_trips", static_cast<int>(config.agent.max_llm_round_trips)));
+        const int max_attempts = guards.value("max_repair_attempts",
+                                              static_cast<int>(config.agent.max_repair_attempts));
+        if (max_attempts > 0) {
+            config.agent.max_repair_attempts = static_cast<std::size_t>(max_attempts);
+        }
         config.agent.max_concurrent_incidents = static_cast<std::size_t>(guards.value(
             "max_concurrent_incidents", static_cast<int>(config.agent.max_concurrent_incidents)));
         config.agent.dedup_window = std::chrono::seconds{
@@ -193,6 +198,10 @@ Result<AppConfig> load_config(const std::filesystem::path& path) {
             verifier.value("health_timeout_ms",
                            static_cast<int>(config.verifier.health_timeout.count())),
             static_cast<int>(config.verifier.health_timeout.count()))};
+        config.verifier.log_quiet_window = std::chrono::milliseconds{positive(
+            verifier.value("log_quiet_window_ms",
+                           static_cast<int>(config.verifier.log_quiet_window.count())),
+            static_cast<int>(config.verifier.log_quiet_window.count()))};
     }
 
     return Result<AppConfig>::ok(std::move(config));

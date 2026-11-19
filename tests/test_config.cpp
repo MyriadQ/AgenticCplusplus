@@ -31,10 +31,12 @@ TEST_CASE("Config: loads the agent configuration") {
     REQUIRE(config.value().executor.limits.nproc == 4096);
     REQUIRE(config.value().verifier.health_url.find("18080") != std::string::npos);
     REQUIRE(config.value().verifier.health_timeout == std::chrono::milliseconds{5000});
+    REQUIRE(config.value().verifier.log_quiet_window == std::chrono::milliseconds{3000});
     REQUIRE(config.value().llm.model == "deepseek-flash");
     REQUIRE(config.value().llm.timeout_ms == 15000);
     REQUIRE(config.value().agent.max_tool_calls == 4);
     REQUIRE(config.value().agent.max_llm_round_trips == 3);
+    REQUIRE(config.value().agent.max_repair_attempts == 2);
     REQUIRE(config.value().agent.max_concurrent_incidents == 2);
     REQUIRE(config.value().agent.dedup_window == std::chrono::seconds{60});
     REQUIRE(config.value().agent.recall_threshold == Catch::Approx(0.86f));

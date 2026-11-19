@@ -4,6 +4,7 @@ add_executable(unit_tests
   test_result.cpp
   test_types.cpp
   test_line_buffer.cpp
+  test_log_source.cpp
   test_template_parser.cpp
   test_memory_store.cpp
   test_memory_journal.cpp
@@ -15,6 +16,8 @@ add_executable(unit_tests
   test_executor.cpp
   test_sandbox.cpp
   test_verifier.cpp
+  test_cooldown.cpp
+  test_skills.cpp
   test_config.cpp
   test_event_sink.cpp
   # one file per module, added as it is written:

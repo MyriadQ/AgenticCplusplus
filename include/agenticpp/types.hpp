@@ -20,11 +20,13 @@ enum class Phase {
     Idle,
     Detect,
     Recall,
+    Probe,
     Diagnose,
     Propose,
     Authorize,
     Act,
     Verify,
+    Replan,
     Learn,
     Cooldown,
     Done,
@@ -38,6 +40,8 @@ constexpr std::string_view phase_name(Phase phase) noexcept {
             return "Detect";
         case Phase::Recall:
             return "Recall";
+        case Phase::Probe:
+            return "Probe";
         case Phase::Diagnose:
             return "Diagnose";
         case Phase::Propose:
@@ -48,6 +52,8 @@ constexpr std::string_view phase_name(Phase phase) noexcept {
             return "Act";
         case Phase::Verify:
             return "Verify";
+        case Phase::Replan:
+            return "Replan";
         case Phase::Learn:
             return "Learn";
         case Phase::Cooldown:
@@ -150,6 +156,7 @@ public:
 struct AgentConfig {
     std::size_t max_tool_calls = 4;
     std::size_t max_llm_round_trips = 3;
+    std::size_t max_repair_attempts = 2;
     std::size_t max_concurrent_incidents = 2;
     float recall_threshold = 0.86f;
     std::chrono::seconds dedup_window{60};

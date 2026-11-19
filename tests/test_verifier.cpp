@@ -1,7 +1,12 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <memory>
 #include <string>
+#include <system_error>
 #include <thread>
 
 #include <arpa/inet.h>
@@ -10,6 +15,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "agenticpp/template_parser.hpp"
 #include "agenticpp/verifier.hpp"
 
 TEST_CASE("Verifier: always-ok double passes") {
@@ -90,4 +96,83 @@ TEST_CASE("Verifier: invalid health URL is rejected") {
     REQUIRE_FALSE(verdict.ok);
     REQUIRE(verdict.checks.size() == 1);
     REQUIRE(verdict.checks.front().detail == "invalid health URL");
+}
+
+namespace {
+
+std::filesystem::path quiet_log_path(std::string name) {
+    return std::filesystem::temp_directory_path() / ("agenticpp_" + std::move(name) + ".log");
+}
+
+void append_line(const std::filesystem::path& path, std::string_view line) {
+    std::ofstream output(path, std::ios::app | std::ios::binary);
+    output << line << '\n';
+}
+
+}  // namespace
+
+TEST_CASE("Verifier: log quiet passes when the incident does not reappear") {
+    const auto path = quiet_log_path("log_quiet_pass");
+    std::error_code error;
+    std::filesystem::remove(path, error);
+
+    const std::string incident = "2026-01-01T00:00:00Z ERROR bind: address already in use";
+    const std::uint64_t id = agenticpp::parse_template(incident).template_id;
+    append_line(path, incident);
+
+    agenticpp::LogQuietVerifier verifier(
+        std::make_unique<agenticpp::AlwaysOkVerifier>(), path,
+        std::chrono::milliseconds{0});
+    verifier.before_repair(id);
+    append_line(path, "level=info service=victim tick=1 port=18080");
+
+    const auto verdict = verifier.verify(id);
+    REQUIRE(verdict.ok);
+    REQUIRE_FALSE(verdict.checks.empty());
+    REQUIRE(verdict.checks.back().name == "log_quiet");
+    REQUIRE(verdict.checks.back().ok);
+
+    std::filesystem::remove(path, error);
+}
+
+TEST_CASE("Verifier: log quiet fails when the incident reappears") {
+    const auto path = quiet_log_path("log_quiet_fail");
+    std::error_code error;
+    std::filesystem::remove(path, error);
+
+    const std::string incident = "2026-01-01T00:00:00Z ERROR bind: address already in use";
+    const std::uint64_t id = agenticpp::parse_template(incident).template_id;
+    append_line(path, incident);
+
+    agenticpp::LogQuietVerifier verifier(
+        std::make_unique<agenticpp::AlwaysOkVerifier>(), path,
+        std::chrono::milliseconds{0});
+    verifier.before_repair(id);
+    append_line(path, incident);
+
+    const auto verdict = verifier.verify(id);
+    REQUIRE_FALSE(verdict.ok);
+    REQUIRE_FALSE(verdict.checks.empty());
+    REQUIRE(verdict.checks.back().name == "log_quiet");
+    REQUIRE_FALSE(verdict.checks.back().ok);
+    REQUIRE(verdict.checks.back().detail.find("appeared") != std::string::npos);
+
+    std::filesystem::remove(path, error);
+}
+
+TEST_CASE("Verifier: log quiet fails without a pre-repair snapshot") {
+    const auto path = quiet_log_path("log_quiet_missing");
+    std::error_code error;
+    std::filesystem::remove(path, error);
+
+    agenticpp::LogQuietVerifier verifier(
+        std::make_unique<agenticpp::AlwaysOkVerifier>(), path,
+        std::chrono::milliseconds{0});
+    verifier.before_repair(42);
+
+    const auto verdict = verifier.verify(42);
+    REQUIRE_FALSE(verdict.ok);
+    REQUIRE_FALSE(verdict.checks.empty());
+    REQUIRE(verdict.checks.back().name == "log_quiet");
+    REQUIRE_FALSE(verdict.checks.back().ok);
 }

@@ -5,7 +5,9 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -15,9 +17,12 @@
 #include <netdb.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <unistd.h>
 
+#include "agenticpp/line_buffer.hpp"
+#include "agenticpp/template_parser.hpp"
 #include "agenticpp/unique_fd.hpp"
 
 namespace agenticpp {
@@ -223,6 +228,105 @@ Verdict HealthProbeVerifier::verify(std::uint64_t) {
         }
     }
 
+    return verdict;
+}
+
+LogQuietVerifier::LogQuietVerifier(std::unique_ptr<Verifier> inner,
+                                   std::filesystem::path log_path,
+                                   std::chrono::milliseconds quiet_window)
+    : inner_(std::move(inner)),
+      log_path_(std::move(log_path)),
+      quiet_window_(quiet_window) {}
+
+void LogQuietVerifier::before_repair(std::uint64_t) {
+    armed_ = false;
+    offset_ = 0;
+    inode_ = 0;
+    armed_at_ = {};
+    if (log_path_.empty()) {
+        return;
+    }
+
+    struct stat status {};
+    if (::stat(log_path_.c_str(), &status) != 0) {
+        return;
+    }
+    offset_ = static_cast<std::uint64_t>(status.st_size);
+    inode_ = static_cast<std::uint64_t>(status.st_ino);
+    armed_at_ = std::chrono::system_clock::now();
+    armed_ = true;
+}
+
+Verdict LogQuietVerifier::verify(std::uint64_t template_id) {
+    Verdict verdict = inner_->verify(template_id);
+    if (log_path_.empty()) {
+        return verdict;
+    }
+    if (!armed_) {
+        verdict.ok = false;
+        verdict.checks.push_back(
+            Check{"log_quiet", false, "no pre-repair log snapshot"});
+        return verdict;
+    }
+
+    const Timestamp deadline = armed_at_ + quiet_window_;
+    const Timestamp current = std::chrono::system_clock::now();
+    if (current < deadline) {
+        std::this_thread::sleep_for(deadline - current);
+    }
+
+    struct stat status {};
+    if (::stat(log_path_.c_str(), &status) != 0) {
+        verdict.ok = false;
+        verdict.checks.push_back(Check{"log_quiet", false, "cannot stat log file"});
+        return verdict;
+    }
+
+    std::uint64_t start = offset_;
+    if (static_cast<std::uint64_t>(status.st_ino) != inode_ ||
+        static_cast<std::uint64_t>(status.st_size) < offset_) {
+        // Rotation or truncation: inspect the replacement file from the start.
+        start = 0;
+    }
+
+    constexpr std::uint64_t kMaxRead = 8ull * 1024 * 1024;
+    std::uint64_t available =
+        static_cast<std::uint64_t>(status.st_size) > start
+            ? static_cast<std::uint64_t>(status.st_size) - start
+            : 0;
+    available = std::min(available, kMaxRead);
+
+    std::string content;
+    if (available > 0) {
+        std::ifstream input(log_path_, std::ios::binary);
+        if (!input) {
+            verdict.ok = false;
+            verdict.checks.push_back(Check{"log_quiet", false, "cannot open log file"});
+            return verdict;
+        }
+        input.seekg(static_cast<std::streamoff>(start));
+        content.resize(static_cast<std::size_t>(available));
+        input.read(content.data(), static_cast<std::streamsize>(content.size()));
+        content.resize(static_cast<std::size_t>(input.gcount()));
+    }
+
+    LineBuffer buffer;
+    buffer.append(std::span<const char>(content.data(), content.size()));
+    buffer.flush_eof();
+
+    std::size_t matches = 0;
+    while (const auto line = buffer.next_line()) {
+        if (parse_template(*line).template_id == template_id) {
+            ++matches;
+        }
+    }
+
+    const bool quiet = matches == 0;
+    std::string detail = quiet ? "incident template did not reappear"
+                               : "incident template appeared " + std::to_string(matches) +
+                                     " time(s) during the quiet window";
+    verdict.checks.push_back(Check{"log_quiet", quiet, std::move(detail)});
+    verdict.ok = verdict.ok && quiet;
     return verdict;
 }
 

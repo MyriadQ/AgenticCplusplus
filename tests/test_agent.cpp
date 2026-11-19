@@ -44,6 +44,46 @@ public:
     }
 };
 
+class SequencedRunner final : public agenticpp::CommandRunner {
+public:
+    std::vector<int> exits;
+    std::size_t calls = 0;
+
+    agenticpp::ExecResult run(const std::vector<std::string>&) override {
+        agenticpp::ExecResult result;
+        result.exit_code = calls < exits.size() ? exits[calls] : 0;
+        ++calls;
+        return result;
+    }
+};
+
+class FixedSkill final : public agenticpp::Skill {
+public:
+    agenticpp::SkillResult result;
+
+    agenticpp::SkillResult probe(const agenticpp::SkillContext&) const override {
+        return result;
+    }
+};
+
+class SequencedVerifier final : public agenticpp::Verifier {
+public:
+    std::vector<bool> results;
+    std::size_t calls = 0;
+    std::size_t before_calls = 0;
+
+    void before_repair(std::uint64_t) override { ++before_calls; }
+
+    agenticpp::Verdict verify(std::uint64_t) override {
+        const bool ok = calls < results.size() ? results[calls] : true;
+        ++calls;
+        agenticpp::Verdict verdict;
+        verdict.ok = ok;
+        verdict.checks.push_back(agenticpp::Check{"fake_health", ok, ok ? "ok" : "failed"});
+        return verdict;
+    }
+};
+
 std::filesystem::path source_root() {
     return std::filesystem::path{AGENTICPP_SOURCE_DIR};
 }
@@ -177,7 +217,7 @@ TEST_CASE("Agent: denied argv never reaches the runner") {
     agent.on_line(kIncident);
     agent.run_once();
 
-    REQUIRE(llm.calls == 1);
+    REQUIRE(llm.calls == 2);
     REQUIRE(runner.calls == 0);
     REQUIRE(memory.size() == 0);
     REQUIRE(agent.trail().back().to == agenticpp::Phase::Cooldown);
@@ -220,9 +260,10 @@ TEST_CASE("Agent: phase trail is exact on a successful miss") {
     agent.run_once();
 
     const std::vector<agenticpp::Phase> expected{
-        agenticpp::Phase::Detect,   agenticpp::Phase::Recall,  agenticpp::Phase::Diagnose,
-        agenticpp::Phase::Propose,  agenticpp::Phase::Authorize, agenticpp::Phase::Act,
-        agenticpp::Phase::Verify,   agenticpp::Phase::Learn,   agenticpp::Phase::Done,
+        agenticpp::Phase::Detect,   agenticpp::Phase::Recall,  agenticpp::Phase::Probe,
+        agenticpp::Phase::Diagnose, agenticpp::Phase::Propose, agenticpp::Phase::Authorize,
+        agenticpp::Phase::Act,      agenticpp::Phase::Verify,  agenticpp::Phase::Learn,
+        agenticpp::Phase::Done,
     };
 
     REQUIRE(visited_phases(agent) == expected);
@@ -302,4 +343,252 @@ TEST_CASE("Agent: persisted journal gives a recall hit after restart") {
     REQUIRE(agent.trail().back().to == agenticpp::Phase::Done);
 
     std::filesystem::remove_all(root, error);
+}
+
+TEST_CASE("Agent: failed verification replans and learns the second proposal") {
+    auto policy = load_policy();
+    REQUIRE(policy.has_value());
+
+    agenticpp::MemoryStore memory;
+    agenticpp::FakeLlmClient llm;
+    llm.replies = {
+        make_reply({"scripts/restart-victim.sh"}, "restart"),
+        make_reply({"scripts/kill-decoy.sh"}, "free port"),
+    };
+    SequencedRunner runner;
+    runner.exits = {0, 0};
+    SequencedVerifier verifier;
+    verifier.results = {false, true};
+    agenticpp::RecordingSink sink;
+    agenticpp::AgentConfig config;
+    config.max_repair_attempts = 2;
+
+    agenticpp::Agent agent(config, memory, llm, policy.value(), runner, verifier, sink);
+    agent.on_line(kIncident);
+    agent.run_once();
+
+    REQUIRE(llm.calls == 2);
+    REQUIRE(runner.calls == 2);
+    REQUIRE(verifier.calls == 2);
+    REQUIRE(verifier.before_calls == 2);
+    REQUIRE(memory.size() == 1);
+    REQUIRE(agent.trail().back().to == agenticpp::Phase::Done);
+    REQUIRE(std::find_if(agent.trail().begin(), agent.trail().end(),
+                         [](const agenticpp::Transition& transition) {
+                             return transition.to == agenticpp::Phase::Replan;
+                         }) != agent.trail().end());
+
+    const auto parsed = agenticpp::parse_template(kIncident);
+    const auto hits = memory.search(parsed.template_text);
+    REQUIRE(hits.size() == 1);
+    REQUIRE(hits.front().record->argv.front().ends_with("scripts/kill-decoy.sh"));
+}
+
+TEST_CASE("Agent: failed command replans and does not retry the same argv") {
+    auto policy = load_policy();
+    REQUIRE(policy.has_value());
+
+    agenticpp::MemoryStore memory;
+    agenticpp::FakeLlmClient llm;
+    llm.replies = {
+        make_reply({"scripts/restart-victim.sh"}, "restart"),
+        make_reply({"scripts/kill-decoy.sh"}, "free port"),
+    };
+    SequencedRunner runner;
+    runner.exits = {1, 0};
+    agenticpp::AlwaysOkVerifier verifier;
+    agenticpp::RecordingSink sink;
+    agenticpp::AgentConfig config;
+    config.max_repair_attempts = 2;
+
+    agenticpp::Agent agent(config, memory, llm, policy.value(), runner, verifier, sink);
+    agent.on_line(kIncident);
+    agent.run_once();
+
+    REQUIRE(llm.calls == 2);
+    REQUIRE(runner.calls == 2);
+    REQUIRE(memory.size() == 1);
+    REQUIRE(agent.trail().back().to == agenticpp::Phase::Done);
+}
+
+TEST_CASE("Agent: exhausted attempts end in Cooldown without learning") {
+    auto policy = load_policy();
+    REQUIRE(policy.has_value());
+
+    agenticpp::MemoryStore memory;
+    agenticpp::FakeLlmClient llm;
+    llm.replies = {
+        make_reply({"scripts/restart-victim.sh"}, "restart"),
+        make_reply({"scripts/kill-decoy.sh"}, "free port"),
+    };
+    SequencedRunner runner;
+    runner.exits = {1, 1};
+    agenticpp::AlwaysOkVerifier verifier;
+    agenticpp::RecordingSink sink;
+    agenticpp::AgentConfig config;
+    config.max_repair_attempts = 2;
+
+    agenticpp::Agent agent(config, memory, llm, policy.value(), runner, verifier, sink);
+    agent.on_line(kIncident);
+    agent.run_once();
+
+    REQUIRE(llm.calls == 2);
+    REQUIRE(runner.calls == 2);
+    REQUIRE(memory.size() == 0);
+    REQUIRE(agent.trail().back().to == agenticpp::Phase::Cooldown);
+    REQUIRE(agent.trail().back().reason.find("exhausted") != std::string::npos);
+}
+
+TEST_CASE("Agent: cooldown suppresses a repeated template after failure") {
+    auto policy = load_policy();
+    REQUIRE(policy.has_value());
+
+    agenticpp::AgentConfig config;
+    config.max_repair_attempts = 1;
+    config.cooldown_initial = std::chrono::seconds{60};
+    config.cooldown_max = std::chrono::seconds{120};
+    agenticpp::CooldownTable cooldown(config);
+
+    agenticpp::MemoryStore memory;
+    agenticpp::FakeLlmClient llm;
+    llm.reply = make_reply({"scripts/kill-decoy.sh"}, "free port");
+    agenticpp::DryRunRunner runner;
+    FailingVerifier verifier;
+    agenticpp::RecordingSink sink;
+
+    agenticpp::Agent agent(config, memory, llm, policy.value(), runner, verifier, sink, &cooldown);
+    agent.on_line(kIncident);
+    agent.run_once();
+    REQUIRE(llm.calls == 1);
+    REQUIRE(agent.trail().back().to == agenticpp::Phase::Cooldown);
+
+    agent.on_line(kIncident);
+    agent.run_once();
+    REQUIRE(llm.calls == 1);
+    REQUIRE(agent.trail().back().to == agenticpp::Phase::Cooldown);
+    REQUIRE(agent.trail().back().reason.find("cooldown") != std::string::npos);
+}
+
+TEST_CASE("Agent: success deduplicates a repeated template") {
+    auto policy = load_policy();
+    REQUIRE(policy.has_value());
+
+    agenticpp::AgentConfig config;
+    config.max_repair_attempts = 1;
+    config.dedup_window = std::chrono::seconds{60};
+    agenticpp::CooldownTable cooldown(config);
+
+    agenticpp::MemoryStore memory;
+    agenticpp::FakeLlmClient llm;
+    llm.reply = make_reply({"scripts/kill-decoy.sh"}, "free port");
+    agenticpp::DryRunRunner runner;
+    agenticpp::AlwaysOkVerifier verifier;
+    agenticpp::RecordingSink sink;
+
+    agenticpp::Agent agent(config, memory, llm, policy.value(), runner, verifier, sink, &cooldown);
+    agent.on_line(kIncident);
+    agent.run_once();
+    REQUIRE(llm.calls == 1);
+    REQUIRE(memory.size() == 1);
+
+    agent.on_line(kIncident);
+    agent.run_once();
+    REQUIRE(llm.calls == 1);
+    REQUIRE(memory.size() == 1);
+    REQUIRE(agent.trail().back().to == agenticpp::Phase::Cooldown);
+    REQUIRE(agent.trail().back().reason.find("deduplicated") != std::string::npos);
+}
+
+TEST_CASE("Agent: duplicate proposal is not executed twice") {
+    auto policy = load_policy();
+    REQUIRE(policy.has_value());
+
+    agenticpp::MemoryStore memory;
+    agenticpp::FakeLlmClient llm;
+    llm.replies = {
+        make_reply({"scripts/kill-decoy.sh"}, "first"),
+        make_reply({"scripts/kill-decoy.sh"}, "duplicate"),
+    };
+    SequencedRunner runner;
+    runner.exits = {0};
+    SequencedVerifier verifier;
+    verifier.results = {false, true};
+    agenticpp::RecordingSink sink;
+    agenticpp::AgentConfig config;
+    config.max_repair_attempts = 2;
+
+    agenticpp::Agent agent(config, memory, llm, policy.value(), runner, verifier, sink);
+    agent.on_line(kIncident);
+    agent.run_once();
+
+    REQUIRE(llm.calls == 2);
+    REQUIRE(runner.calls == 1);
+    REQUIRE(memory.size() == 0);
+    REQUIRE(agent.trail().back().to == agenticpp::Phase::Cooldown);
+    REQUIRE(agent.trail().back().reason.find("duplicate") != std::string::npos);
+}
+
+TEST_CASE("Agent: a conclusive skill skips the LLM") {
+    auto policy = load_policy();
+    REQUIRE(policy.has_value());
+
+    agenticpp::MemoryStore memory;
+    agenticpp::FakeLlmClient llm;
+    agenticpp::DryRunRunner runner;
+    agenticpp::AlwaysOkVerifier verifier;
+    agenticpp::RecordingSink sink;
+    agenticpp::AgentConfig config;
+
+    auto skill = std::make_unique<FixedSkill>();
+    skill->result.conclusive = true;
+    skill->result.cause = "port_conflict";
+    skill->result.confidence = 0.99;
+    skill->result.suggested_argv = {"scripts/kill-decoy.sh"};
+    skill->result.evidence.push_back(
+        agenticpp::Evidence{"port_conflict", "port 18080 is in LISTEN state"});
+    std::vector<std::unique_ptr<agenticpp::Skill>> skill_list;
+    skill_list.push_back(std::move(skill));
+    agenticpp::SkillRegistry skills{std::move(skill_list)};
+
+    agenticpp::Agent agent(config, memory, llm, policy.value(), runner, verifier, sink,
+                           nullptr, &skills);
+    agent.on_line(kIncident);
+    agent.run_once();
+
+    REQUIRE(llm.calls == 0);
+    REQUIRE(memory.size() == 1);
+    const auto phases = visited_phases(agent);
+    REQUIRE(std::find(phases.begin(), phases.end(), agenticpp::Phase::Probe) != phases.end());
+    REQUIRE(std::find(phases.begin(), phases.end(), agenticpp::Phase::Diagnose) == phases.end());
+    REQUIRE(agent.trail().back().to == agenticpp::Phase::Done);
+}
+
+TEST_CASE("Agent: inconclusive skill evidence reaches the LLM prompt") {
+    auto policy = load_policy();
+    REQUIRE(policy.has_value());
+
+    agenticpp::MemoryStore memory;
+    agenticpp::FakeLlmClient llm;
+    llm.reply = make_reply({"scripts/kill-decoy.sh"}, "free port");
+    agenticpp::DryRunRunner runner;
+    agenticpp::AlwaysOkVerifier verifier;
+    agenticpp::RecordingSink sink;
+    agenticpp::AgentConfig config;
+
+    auto skill = std::make_unique<FixedSkill>();
+    skill->result.evidence.push_back(
+        agenticpp::Evidence{"service_state", "port 18080 is in LISTEN state"});
+    std::vector<std::unique_ptr<agenticpp::Skill>> skill_list;
+    skill_list.push_back(std::move(skill));
+    agenticpp::SkillRegistry skills{std::move(skill_list)};
+
+    agenticpp::Agent agent(config, memory, llm, policy.value(), runner, verifier, sink,
+                           nullptr, &skills);
+    agent.on_line(kIncident);
+    agent.run_once();
+
+    REQUIRE(llm.calls == 1);
+    REQUIRE_FALSE(llm.prompts.empty());
+    REQUIRE(llm.prompts.back().find("Local diagnostic evidence") != std::string::npos);
+    REQUIRE(llm.prompts.back().find("port 18080 is in LISTEN state") != std::string::npos);
 }

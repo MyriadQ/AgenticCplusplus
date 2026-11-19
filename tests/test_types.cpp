@@ -33,11 +33,13 @@ TEST_CASE("Phase: names are stable") {
     REQUIRE(agenticpp::phase_name(agenticpp::Phase::Idle) == "Idle");
     REQUIRE(agenticpp::phase_name(agenticpp::Phase::Detect) == "Detect");
     REQUIRE(agenticpp::phase_name(agenticpp::Phase::Recall) == "Recall");
+    REQUIRE(agenticpp::phase_name(agenticpp::Phase::Probe) == "Probe");
     REQUIRE(agenticpp::phase_name(agenticpp::Phase::Diagnose) == "Diagnose");
     REQUIRE(agenticpp::phase_name(agenticpp::Phase::Propose) == "Propose");
     REQUIRE(agenticpp::phase_name(agenticpp::Phase::Authorize) == "Authorize");
     REQUIRE(agenticpp::phase_name(agenticpp::Phase::Act) == "Act");
     REQUIRE(agenticpp::phase_name(agenticpp::Phase::Verify) == "Verify");
+    REQUIRE(agenticpp::phase_name(agenticpp::Phase::Replan) == "Replan");
     REQUIRE(agenticpp::phase_name(agenticpp::Phase::Learn) == "Learn");
     REQUIRE(agenticpp::phase_name(agenticpp::Phase::Cooldown) == "Cooldown");
     REQUIRE(agenticpp::phase_name(agenticpp::Phase::Done) == "Done");
@@ -57,6 +59,7 @@ TEST_CASE("AgentConfig: budgets have safe defaults") {
 
     REQUIRE(config.max_tool_calls == 4);
     REQUIRE(config.max_llm_round_trips == 3);
+    REQUIRE(config.max_repair_attempts == 2);
     REQUIRE(config.max_concurrent_incidents == 2);
     REQUIRE(config.recall_threshold == 0.86f);
     REQUIRE(config.dedup_window == std::chrono::seconds{60});

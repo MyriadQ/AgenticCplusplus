@@ -1,10 +1,13 @@
 // agentd — replay-driven repair agent with a bounded phase machine.
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
+#include <csignal>
 #include <exception>
+#include <functional>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -24,9 +27,11 @@
 #include "agenticpp/executor.hpp"
 #include "agenticpp/incident_queue.hpp"
 #include "agenticpp/line_buffer.hpp"
+#include "agenticpp/log_source.hpp"
 #include "agenticpp/llm_client.hpp"
 #include "agenticpp/memory_store.hpp"
 #include "agenticpp/policy.hpp"
+#include "agenticpp/skills.hpp"
 #include "agenticpp/template_parser.hpp"
 #include "agenticpp/verifier.hpp"
 #include "agenticpp/version.hpp"
@@ -47,7 +52,9 @@ void print_usage(std::string_view argv0) {
         "  --help                    print this help and exit\n"
         "  --config PATH             runtime config (default config/agent.json)\n"
         "  --replay PATH             replay a log file once, from byte 0\n"
-        "  --from-start              accepted for compatibility; replay starts at byte 0\n"
+        "  --follow [PATH]           tail the configured log file continuously\n"
+        "  --poll-ms N               follow poll interval override\n"
+        "  --from-start              follow from byte 0 instead of EOF\n"
         "  --stats                   print replay line/dropped/byte counts\n"
         "  --dump-templates          print each parsed template id and masked text\n"
         "  --dry-run                 run the Agent loop without execution (default for Agent mode)\n"
@@ -60,6 +67,7 @@ void print_usage(std::string_view argv0) {
         "  --llm-smoke               warm up the configured real LLM and exit\n"
         "  --workers N               process incidents with N bounded workers\n"
         "                            (default: guards.max_concurrent_incidents)\n"
+        "  --no-skills               force the LLM path instead of local Probe skills\n"
         "  --keep-memory-journal     do not compact the memory journal on exit\n"
         "  --seed-fix TEXT PROGRAM   seed an in-memory fix for a dev probe\n"
         "  --recall TEXT             query the in-memory store\n"
@@ -118,7 +126,17 @@ public:
         }
 
         try {
-            const nlohmann::json json = nlohmann::json::parse(*data);
+            nlohmann::json json = nlohmann::json::parse(*data);
+            if (json.is_object() && json.contains("replies") && json["replies"].is_array()) {
+                const auto& replies = json["replies"];
+                if (replies.empty()) {
+                    return agenticpp::Result<agenticpp::ChatReply>::err(
+                        3, "cassette has an empty replies array");
+                }
+                const std::size_t index = std::min(calls_, replies.size() - 1);
+                json = replies[index];
+            }
+            ++calls_;
             agenticpp::ChatReply reply;
             reply.content = json.value("content", std::string{});
             reply.finish_reason = json.value("finish_reason", std::string{});
@@ -143,6 +161,7 @@ public:
 
 private:
     std::string path_;
+    std::size_t calls_ = 0;
 };
 
 class NoLlmClient final : public agenticpp::LlmClient {
@@ -232,6 +251,22 @@ fs::path resolve_project_path(const std::string& path) {
     return project_root() / candidate;
 }
 
+int port_from_http_url(std::string_view url, int fallback) {
+    const std::size_t colon = url.rfind(':');
+    if (colon == std::string_view::npos || colon + 1 >= url.size()) {
+        return fallback;
+    }
+    std::size_t end = colon + 1;
+    while (end < url.size() && url[end] >= '0' && url[end] <= '9') {
+        ++end;
+    }
+    if (end == colon + 1) {
+        return fallback;
+    }
+    const int port = std::atoi(std::string{url.substr(colon + 1, end - colon - 1)}.c_str());
+    return port > 0 && port <= 65535 ? port : fallback;
+}
+
 agenticpp::MemoryStoreConfig memory_config_from(const agenticpp::MemoryConfig& config,
                                                bool write_through) {
     agenticpp::MemoryStoreConfig memory;
@@ -248,15 +283,25 @@ agenticpp::MemoryStoreConfig memory_config_from(const agenticpp::MemoryConfig& c
     return memory;
 }
 
-int run_agent_replay(const std::string& replay_path, const std::string& config_path, bool execute,
-                     bool stats, const std::string& llm_mode, const std::string& cassette_path,
-                     std::size_t workers, bool compact_on_exit) {
-    const auto data = read_file(replay_path);
-    if (!data.has_value()) {
-        std::fprintf(stderr, "agentd: cannot read '%s'\n", replay_path.c_str());
-        return 2;
-    }
+struct IngestStats {
+    std::size_t lines = 0;
+    std::size_t dropped = 0;
+    std::size_t bytes = 0;
+};
 
+using IngestFunction = std::function<IngestStats(agenticpp::IncidentQueue&)>;
+
+volatile std::sig_atomic_t g_follow_stop = 0;
+
+extern "C" void handle_follow_signal(int) {
+    g_follow_stop = 1;
+}
+
+int run_agent_ingest(const std::string& config_path, bool execute, bool stats,
+                     const std::string& llm_mode, const std::string& cassette_path,
+                     std::size_t workers, bool compact_on_exit, bool enable_skills,
+                     std::string_view stats_label, const std::string& log_path_override,
+                     const IngestFunction& ingest) {
     if (execute && fs::exists(project_root() / "data/STOP")) {
         std::fprintf(stderr, "agentd: data/STOP exists; refusing to execute\n");
         return 2;
@@ -306,8 +351,6 @@ int run_agent_replay(const std::string& replay_path, const std::string& config_p
         }
 #if AGENTICPP_ENABLE_LLM
         agenticpp::LlmConfig llm_config = config.value().llm;
-        // One warmup is enough; extra workers get their own easy handle but no
-        // duplicate startup request.
         if (worker != 0) {
             llm_config.warmup = false;
         }
@@ -326,6 +369,13 @@ int run_agent_replay(const std::string& replay_path, const std::string& config_p
     }
 
     config.value().executor.sandbox_root = project_root();
+    const std::string log_path =
+        log_path_override.empty() ? config.value().log_source.path : log_path_override;
+    if (!log_path.empty()) {
+        config.value().verifier.log_path = resolve_project_path(log_path);
+    } else {
+        config.value().verifier.log_path.clear();
+    }
 
     std::unique_ptr<agenticpp::CommandRunner> runner;
     if (execute) {
@@ -334,20 +384,40 @@ int run_agent_replay(const std::string& replay_path, const std::string& config_p
         runner = std::make_unique<agenticpp::DryRunRunner>();
     }
 
-    std::unique_ptr<agenticpp::Verifier> verifier;
-    if (execute) {
-        verifier = std::make_unique<agenticpp::HealthProbeVerifier>(config.value().verifier);
-    } else {
-        verifier = std::make_unique<agenticpp::AlwaysOkVerifier>();
+    std::vector<std::unique_ptr<agenticpp::Verifier>> verifiers;
+    verifiers.reserve(workers);
+    for (std::size_t worker = 0; worker < workers; ++worker) {
+        if (!execute) {
+            verifiers.push_back(std::make_unique<agenticpp::AlwaysOkVerifier>());
+            continue;
+        }
+        auto health = std::make_unique<agenticpp::HealthProbeVerifier>(config.value().verifier);
+        if (!config.value().verifier.log_path.empty() &&
+            config.value().verifier.log_quiet_window.count() > 0) {
+            verifiers.push_back(std::make_unique<agenticpp::LogQuietVerifier>(
+                std::move(health), config.value().verifier.log_path,
+                config.value().verifier.log_quiet_window));
+        } else {
+            verifiers.push_back(std::move(health));
+        }
     }
+
+    agenticpp::CooldownTable cooldown(config.value().agent);
+    agenticpp::SkillConfig skill_config;
+    skill_config.project_root = project_root();
+    skill_config.log_path = config.value().verifier.log_path;
+    skill_config.run_dir = project_root() / "run";
+    skill_config.default_port =
+        port_from_http_url(config.value().verifier.health_url, 18080);
+    agenticpp::SkillRegistry skills{std::move(skill_config)};
 
     agenticpp::ConsoleSink console;
     agenticpp::JsonlSink jsonl(project_root() / "data/audit.log");
     agenticpp::TeeSink tee(console, jsonl);
     agenticpp::SynchronizedSink sink(tee);
 
-    agenticpp::MemoryStore memory{agenticpp::Vectorizer{}, memory_config_from(config.value().memory,
-                                                                              false)};
+    agenticpp::MemoryStore memory{agenticpp::Vectorizer{},
+                                  memory_config_from(config.value().memory, false)};
     memory.set_write_through(false);
     const auto loaded = memory.load();
     if (!loaded.has_value()) {
@@ -364,38 +434,21 @@ int run_agent_replay(const std::string& replay_path, const std::string& config_p
     agents.reserve(workers);
     for (std::size_t worker = 0; worker < workers; ++worker) {
         agents.push_back(std::make_unique<agenticpp::Agent>(
-            config.value().agent, memory, *llms[worker], policy.value(), *runner, *verifier,
-            sink));
+            config.value().agent, memory, *llms[worker], policy.value(), *runner,
+            *verifiers[worker], sink, &cooldown, enable_skills ? &skills : nullptr));
     }
 
-    agenticpp::LineBuffer buffer;
-    buffer.append(std::span<const char>(data->data(), data->size()));
-    buffer.flush_eof();
+    const std::size_t capacity = std::max<std::size_t>(workers * 8, 32);
+    agenticpp::IncidentQueue queue(
+        workers, capacity,
+        [&agents](std::size_t worker, const std::string& line) {
+            agents[worker]->on_line(line);
+            agents[worker]->run_once();
+        });
 
-    std::size_t lines = 0;
-    if (workers == 1) {
-        while (const auto line = buffer.next_line()) {
-            ++lines;
-            agents.front()->on_line(*line);
-            agents.front()->run_once();
-        }
-    } else {
-        const std::size_t capacity = std::max<std::size_t>(workers * 8, 32);
-        agenticpp::IncidentQueue queue(
-            workers, capacity,
-            [&agents](std::size_t worker, const std::string& line) {
-                agents[worker]->on_line(line);
-                agents[worker]->run_once();
-            });
-        while (const auto line = buffer.next_line()) {
-            ++lines;
-            if (!queue.submit(std::string{*line})) {
-                break;
-            }
-        }
-        queue.wait_idle();
-        queue.stop();
-    }
+    const IngestStats totals = ingest(queue);
+    queue.wait_idle();
+    queue.stop();
 
     if (execute && loaded.has_value() && compact_on_exit) {
         const auto compacted = memory.compact();
@@ -406,10 +459,108 @@ int run_agent_replay(const std::string& replay_path, const std::string& config_p
     }
 
     if (stats) {
-        std::printf("replay: lines=%zu dropped=%zu bytes=%zu\n", lines, buffer.dropped_lines(),
-                    data->size());
+        std::printf("%.*s: lines=%zu dropped=%zu bytes=%zu\n",
+                    static_cast<int>(stats_label.size()), stats_label.data(), totals.lines,
+                    totals.dropped, totals.bytes);
     }
     return 0;
+}
+
+int run_agent_replay(const std::string& replay_path, const std::string& config_path, bool execute,
+                     bool stats, const std::string& llm_mode, const std::string& cassette_path,
+                     std::size_t workers, bool compact_on_exit, bool enable_skills) {
+    auto data = read_file(replay_path);
+    if (!data.has_value()) {
+        std::fprintf(stderr, "agentd: cannot read '%s'\n", replay_path.c_str());
+        return 2;
+    }
+
+    return run_agent_ingest(
+        config_path, execute, stats, llm_mode, cassette_path, workers, compact_on_exit,
+        enable_skills, "replay", {}, [data = std::move(data)](agenticpp::IncidentQueue& queue) {
+            IngestStats totals;
+            totals.bytes = data->size();
+            agenticpp::LineBuffer buffer;
+            buffer.append(std::span<const char>(data->data(), data->size()));
+            buffer.flush_eof();
+            while (const auto line = buffer.next_line()) {
+                ++totals.lines;
+                if (!queue.submit(std::string{*line})) {
+                    break;
+                }
+            }
+            totals.dropped = buffer.dropped_lines();
+            return totals;
+        });
+}
+
+int run_agent_follow(const std::string& follow_path, const std::string& config_path, bool execute,
+                     bool stats, const std::string& llm_mode, const std::string& cassette_path,
+                     std::size_t workers, bool compact_on_exit, bool enable_skills, bool from_start,
+                     int poll_ms) {
+    auto config = agenticpp::load_config(resolve_config_path(config_path));
+    if (!config.has_value()) {
+        std::fprintf(stderr, "agentd: config error: %s\n", config.error().message.c_str());
+        return 2;
+    }
+
+    const std::string path =
+        follow_path.empty() ? config.value().log_source.path : follow_path;
+    if (path.empty()) {
+        std::fprintf(stderr, "agentd: --follow needs a log path\n");
+        return 2;
+    }
+    const int configured_interval = poll_ms > 0 ? poll_ms : config.value().log_source.poll_interval_ms;
+    const std::chrono::milliseconds interval{std::max(1, configured_interval)};
+    const bool start_at_beginning = from_start || config.value().log_source.from_start;
+    auto source = agenticpp::make_polling_source(resolve_project_path(path), interval,
+                                                 start_at_beginning);
+    if (!source) {
+        std::fprintf(stderr, "agentd: cannot create log source for '%s'\n", path.c_str());
+        return 2;
+    }
+
+    g_follow_stop = 0;
+    std::signal(SIGINT, handle_follow_signal);
+    std::signal(SIGTERM, handle_follow_signal);
+    std::printf("agentd: following %s poll_ms=%d from_start=%s\n", path.c_str(),
+                static_cast<int>(interval.count()), start_at_beginning ? "yes" : "no");
+    std::fflush(stdout);
+
+    return run_agent_ingest(
+        config_path, execute, stats, llm_mode, cassette_path, workers, compact_on_exit,
+        enable_skills, "follow", path, [&source, interval](agenticpp::IncidentQueue& queue) {
+            IngestStats totals;
+            while (g_follow_stop == 0) {
+                if (fs::exists(project_root() / "data/STOP")) {
+                    std::fprintf(stderr, "agentd: data/STOP present; stopping follow loop\n");
+                    break;
+                }
+                const auto records = source->poll();
+                for (const agenticpp::LogRecord& record : records) {
+                    ++totals.lines;
+                    if (!queue.submit(std::string{record.line})) {
+                        break;
+                    }
+                }
+                if (records.empty()) {
+                    source->wait(interval);
+                }
+            }
+
+            source->flush_eof();
+            const auto final_records = source->poll();
+            for (const agenticpp::LogRecord& record : final_records) {
+                ++totals.lines;
+                if (!queue.submit(std::string{record.line})) {
+                    break;
+                }
+            }
+            const agenticpp::LogSourceStats source_stats = source->stats();
+            totals.dropped = source_stats.dropped;
+            totals.bytes = source_stats.bytes;
+            return totals;
+        });
 }
 
 int check_command_argv(const std::vector<std::string>& command, const std::string& config_path) {
@@ -462,6 +613,10 @@ int main(int argc, char** argv) {
     std::string config_path = "config/agent.json";
     std::string replay_path;
     bool has_replay = false;
+    bool has_follow = false;
+    bool from_start = false;
+    int poll_ms = 0;
+    std::string follow_path;
     bool stats = false;
     bool dump_templates = false;
     bool dry_run = false;
@@ -479,6 +634,7 @@ int main(int argc, char** argv) {
     std::string cassette_path;
     std::size_t workers = 0; // 0 means "use guards.max_concurrent_incidents"
     bool compact_on_exit = true;
+    bool enable_skills = true;
 
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg = argv[i];
@@ -509,6 +665,33 @@ int main(int argc, char** argv) {
             has_replay = true;
             continue;
         }
+        if (arg == "--follow") {
+            has_follow = true;
+            if (i + 1 < argc && !std::string_view{argv[i + 1]}.starts_with("--")) {
+                follow_path = argv[++i];
+            }
+            continue;
+        }
+        if (arg.starts_with("--follow=")) {
+            has_follow = true;
+            follow_path = std::string{arg.substr(std::string_view{"--follow="}.size())};
+            continue;
+        }
+        if (arg == "--poll-ms") {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "agentd: --poll-ms requires a value\n");
+                return 2;
+            }
+            char* end = nullptr;
+            errno = 0;
+            const long value = std::strtol(argv[++i], &end, 10);
+            if (errno != 0 || end == argv[i] || *end != '\0' || value <= 0) {
+                std::fprintf(stderr, "agentd: --poll-ms must be positive\n");
+                return 2;
+            }
+            poll_ms = static_cast<int>(value);
+            continue;
+        }
         if (arg == "--stats") {
             stats = true;
             continue;
@@ -518,6 +701,7 @@ int main(int argc, char** argv) {
             continue;
         }
         if (arg == "--from-start") {
+            from_start = true;
             continue;
         }
         if (arg == "--dry-run") {
@@ -566,6 +750,10 @@ int main(int argc, char** argv) {
         }
         if (arg == "--keep-memory-journal") {
             compact_on_exit = false;
+            continue;
+        }
+        if (arg == "--no-skills") {
+            enable_skills = false;
             continue;
         }
         if (arg == "--workers") {
@@ -634,13 +822,24 @@ int main(int argc, char** argv) {
     }
 
     if (has_seed || has_recall) {
-        if (has_replay || dry_run || execute || llm_smoke) {
-            std::fprintf(stderr, "agentd: memory probe flags cannot be combined with replay\n");
+        if (has_replay || has_follow || dry_run || execute || llm_smoke) {
+            std::fprintf(stderr, "agentd: memory probe flags cannot be combined with replay/follow\n");
             return 2;
         }
         return memory_demo(has_seed, seed_text, seed_program, has_recall, recall_query);
     }
 
+    if (has_replay && has_follow) {
+        std::fprintf(stderr, "agentd: --replay and --follow are mutually exclusive\n");
+        return 2;
+    }
+    if (has_follow && !dry_run && !execute) {
+        dry_run = true;
+    }
+    if (has_follow && dump_templates) {
+        std::fprintf(stderr, "agentd: --dump-templates is only available with --replay\n");
+        return 2;
+    }
     if (dry_run && execute) {
         std::fprintf(stderr, "agentd: --dry-run and --execute are mutually exclusive\n");
         return 2;
@@ -654,16 +853,22 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+    if (has_follow) {
+        return run_agent_follow(follow_path, config_path, execute, stats, llm_mode,
+                                cassette_path, workers, compact_on_exit, enable_skills, from_start,
+                                poll_ms);
+    }
+
     if (has_replay) {
         if (dry_run || execute) {
             return run_agent_replay(replay_path, config_path, execute, stats, llm_mode,
-                                    cassette_path, workers, compact_on_exit);
+                                    cassette_path, workers, compact_on_exit, enable_skills);
         }
         return replay_file(replay_path, stats, dump_templates);
     }
 
     if (dry_run || execute) {
-        std::fprintf(stderr, "agentd: --dry-run/--execute require --replay\n");
+        std::fprintf(stderr, "agentd: --dry-run/--execute require --replay or --follow\n");
         return 2;
     }
     if (stats || dump_templates) {
