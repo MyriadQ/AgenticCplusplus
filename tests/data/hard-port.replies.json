@@ -1,0 +1,26 @@
+{
+  "replies": [
+    {
+      "content": "",
+      "finish_reason": "tool_calls",
+      "tool_calls": [
+        {
+          "id": "call_restart",
+          "name": "run_command",
+          "arguments_json": "{\"argv\":[\"scripts/restart-victim.sh\"],\"purpose\":\"first attempt: restart without freeing the port\"}"
+        }
+      ]
+    },
+    {
+      "content": "",
+      "finish_reason": "tool_calls",
+      "tool_calls": [
+        {
+          "id": "call_kill",
+          "name": "run_command",
+          "arguments_json": "{\"argv\":[\"scripts/kill-decoy.sh\"],\"purpose\":\"second attempt: free the port and restart\"}"
+        }
+      ]
+    }
+  ]
+}

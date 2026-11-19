@@ -13,3 +13,4 @@ run/
 *.swp
 labs/
 docs/
+env/

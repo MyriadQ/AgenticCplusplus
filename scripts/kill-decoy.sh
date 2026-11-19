@@ -30,6 +30,9 @@ if [ -f "$RUN/victim.pid" ]; then
     rm -f "$RUN/victim.pid"
 fi
 
+# Give the kernel a moment to release the old listener before rebinding.
+sleep 0.2
+
 VICTIM_BIN="${VICTIM:-}"
 if [ -z "$VICTIM_BIN" ]; then
     for candidate in "$ROOT/build/debug/bin/victim" "$ROOT/build/gcc-debug/bin/victim" \

@@ -1,0 +1,11 @@
+{
+  "content": "",
+  "finish_reason": "tool_calls",
+  "tool_calls": [
+    {
+      "id": "call_denied",
+      "name": "run_command",
+      "arguments_json": "{\"argv\":[\"sh\",\"-c\",\"kill -9 1\"],\"purpose\":\"unsafe probe\"}"
+    }
+  ]
+}

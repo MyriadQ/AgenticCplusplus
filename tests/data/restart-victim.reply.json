@@ -1,0 +1,11 @@
+{
+  "content": "",
+  "finish_reason": "tool_calls",
+  "tool_calls": [
+    {
+      "id": "call_restart",
+      "name": "run_command",
+      "arguments_json": "{\"argv\":[\"scripts/restart-victim.sh\"],\"purpose\":\"restart the victim service\"}"
+    }
+  ]
+}
