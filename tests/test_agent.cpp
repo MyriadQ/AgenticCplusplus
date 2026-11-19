@@ -1,6 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -245,4 +246,60 @@ TEST_CASE("Agent: non-actionable line is ignored") {
     REQUIRE(llm.calls == 0);
     REQUIRE(memory.size() == 0);
     REQUIRE(agent.trail().empty());
+}
+
+TEST_CASE("Agent: persisted journal gives a recall hit after restart") {
+    auto policy = load_policy();
+    REQUIRE(policy.has_value());
+
+    const std::filesystem::path root =
+        std::filesystem::temp_directory_path() / "agenticpp_agent_persist";
+    std::error_code error;
+    std::filesystem::remove_all(root, error);
+    std::filesystem::create_directories(root, error);
+
+    agenticpp::MemoryStoreConfig memory_config;
+    memory_config.snapshot_path = root / "memory.bin";
+    memory_config.journal_path = root / "memory.journal";
+    memory_config.persistent = true;
+    memory_config.write_through = true;
+    memory_config.compact_after_events = 0;
+
+    {
+        agenticpp::MemoryStore memory{agenticpp::Vectorizer{}, memory_config};
+        agenticpp::FakeLlmClient llm;
+        llm.reply = make_reply({"scripts/kill-decoy.sh"}, "free port 8080");
+        agenticpp::DryRunRunner runner;
+        agenticpp::AlwaysOkVerifier verifier;
+        agenticpp::RecordingSink sink;
+        agenticpp::AgentConfig config;
+
+        agenticpp::Agent agent(config, memory, llm, policy.value(), runner, verifier, sink);
+        agent.on_line(kIncident);
+        agent.run_once();
+
+        REQUIRE(llm.calls == 1);
+        REQUIRE(memory.size() == 1);
+        REQUIRE(agent.trail().back().to == agenticpp::Phase::Done);
+    }
+
+    agenticpp::MemoryStore memory{agenticpp::Vectorizer{}, memory_config};
+    REQUIRE(memory.load().has_value());
+    REQUIRE(memory.size() == 1);
+
+    agenticpp::FakeLlmClient llm;
+    agenticpp::DryRunRunner runner;
+    agenticpp::AlwaysOkVerifier verifier;
+    agenticpp::RecordingSink sink;
+    agenticpp::AgentConfig config;
+    agenticpp::Agent agent(config, memory, llm, policy.value(), runner, verifier, sink);
+    agent.on_line(kIncident);
+    agent.run_once();
+
+    REQUIRE(llm.calls == 0);
+    const auto phases = visited_phases(agent);
+    REQUIRE(std::find(phases.begin(), phases.end(), agenticpp::Phase::Diagnose) == phases.end());
+    REQUIRE(agent.trail().back().to == agenticpp::Phase::Done);
+
+    std::filesystem::remove_all(root, error);
 }

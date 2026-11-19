@@ -1,6 +1,8 @@
 // agentd — replay-driven repair agent with a bounded phase machine.
 #include <algorithm>
+#include <cerrno>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <exception>
 #include <filesystem>
@@ -20,6 +22,7 @@
 #include "agenticpp/config.hpp"
 #include "agenticpp/event_sink.hpp"
 #include "agenticpp/executor.hpp"
+#include "agenticpp/incident_queue.hpp"
 #include "agenticpp/line_buffer.hpp"
 #include "agenticpp/llm_client.hpp"
 #include "agenticpp/memory_store.hpp"
@@ -55,6 +58,8 @@ void print_usage(std::string_view argv0) {
         "  --cassette PATH           cassette file for --llm=cassette\n"
         "  --llm=deepseek            use the real DeepSeek transport\n"
         "  --llm-smoke               warm up the configured real LLM and exit\n"
+        "  --workers N               process incidents with N bounded workers\n"
+        "                            (default: guards.max_concurrent_incidents)\n"
         "  --seed-fix TEXT PROGRAM   seed an in-memory fix for a dev probe\n"
         "  --recall TEXT             query the in-memory store\n"
         "  --check-command ...       check an argv vector against the allowlist\n",
@@ -218,8 +223,33 @@ int replay_file(const std::string& path, bool stats, bool dump_templates) {
     return 0;
 }
 
+fs::path resolve_project_path(const std::string& path) {
+    const fs::path candidate{path};
+    if (candidate.is_absolute()) {
+        return candidate;
+    }
+    return project_root() / candidate;
+}
+
+agenticpp::MemoryStoreConfig memory_config_from(const agenticpp::MemoryConfig& config,
+                                               bool write_through) {
+    agenticpp::MemoryStoreConfig memory;
+    memory.persistent = !config.path.empty();
+    memory.snapshot_path = resolve_project_path(config.path);
+    if (!config.journal_path.empty()) {
+        memory.journal_path = resolve_project_path(config.journal_path);
+    } else if (memory.persistent) {
+        memory.journal_path = memory.snapshot_path;
+        memory.journal_path.replace_extension(".journal");
+    }
+    memory.write_through = write_through;
+    memory.compact_after_events = config.compact_after_events;
+    return memory;
+}
+
 int run_agent_replay(const std::string& replay_path, const std::string& config_path, bool execute,
-                     bool stats, const std::string& llm_mode, const std::string& cassette_path) {
+                     bool stats, const std::string& llm_mode, const std::string& cassette_path,
+                     std::size_t workers) {
     const auto data = read_file(replay_path);
     if (!data.has_value()) {
         std::fprintf(stderr, "agentd: cannot read '%s'\n", replay_path.c_str());
@@ -243,33 +273,58 @@ int run_agent_replay(const std::string& replay_path, const std::string& config_p
         return 2;
     }
 
-    std::unique_ptr<agenticpp::LlmClient> llm;
-    if (llm_mode == "cassette") {
-        if (cassette_path.empty()) {
-            std::fprintf(stderr, "agentd: cassette mode requires a path\n");
-            return 2;
-        }
-        llm = std::make_unique<CassetteLlmClient>(cassette_path);
-    } else if (llm_mode == "none") {
-        llm = std::make_unique<NoLlmClient>();
-    } else if (llm_mode == "deepseek") {
-#if AGENTICPP_ENABLE_LLM
-        auto client = std::make_unique<agenticpp::DeepSeekClient>(config.value().llm);
-        auto warm = client->warmup();
-        if (!warm.has_value()) {
-            std::fprintf(stderr, "agentd: LLM warmup failed: %s\n", warm.error().message.c_str());
-            return 2;
-        }
-        std::printf("agentd: llm warmup ok\n");
-        llm = std::move(client);
-#else
-        std::fprintf(stderr, "agentd: LLM support was not built (AGENTICPP_ENABLE_LLM=0)\n");
+    if (workers == 0) {
+        workers = std::max<std::size_t>(1, config.value().agent.max_concurrent_incidents);
+    }
+
+    if (llm_mode == "cassette" && cassette_path.empty()) {
+        std::fprintf(stderr, "agentd: cassette mode requires a path\n");
         return 2;
-#endif
-    } else {
+    }
+    if (llm_mode != "cassette" && llm_mode != "none" && llm_mode != "deepseek") {
         std::fprintf(stderr, "agentd: unknown LLM mode '%s'\n", llm_mode.c_str());
         return 2;
     }
+#if !AGENTICPP_ENABLE_LLM
+    if (llm_mode == "deepseek") {
+        std::fprintf(stderr, "agentd: LLM support was not built (AGENTICPP_ENABLE_LLM=0)\n");
+        return 2;
+    }
+#endif
+
+    std::vector<std::unique_ptr<agenticpp::LlmClient>> llms;
+    llms.reserve(workers);
+    for (std::size_t worker = 0; worker < workers; ++worker) {
+        if (llm_mode == "cassette") {
+            llms.push_back(std::make_unique<CassetteLlmClient>(cassette_path));
+            continue;
+        }
+        if (llm_mode == "none") {
+            llms.push_back(std::make_unique<NoLlmClient>());
+            continue;
+        }
+#if AGENTICPP_ENABLE_LLM
+        agenticpp::LlmConfig llm_config = config.value().llm;
+        // One warmup is enough; extra workers get their own easy handle but no
+        // duplicate startup request.
+        if (worker != 0) {
+            llm_config.warmup = false;
+        }
+        auto client = std::make_unique<agenticpp::DeepSeekClient>(llm_config);
+        if (worker == 0) {
+            auto warm = client->warmup();
+            if (!warm.has_value()) {
+                std::fprintf(stderr, "agentd: LLM warmup failed: %s\n",
+                             warm.error().message.c_str());
+                return 2;
+            }
+            std::printf("agentd: llm warmup ok\n");
+        }
+        llms.push_back(std::move(client));
+#endif
+    }
+
+    config.value().executor.sandbox_root = project_root();
 
     std::unique_ptr<agenticpp::CommandRunner> runner;
     if (execute) {
@@ -287,20 +342,66 @@ int run_agent_replay(const std::string& replay_path, const std::string& config_p
 
     agenticpp::ConsoleSink console;
     agenticpp::JsonlSink jsonl(project_root() / "data/audit.log");
-    agenticpp::TeeSink sink(console, jsonl);
-    agenticpp::MemoryStore memory;
-    agenticpp::Agent agent(config.value().agent, memory, *llm, policy.value(), *runner,
-                           *verifier, sink);
+    agenticpp::TeeSink tee(console, jsonl);
+    agenticpp::SynchronizedSink sink(tee);
+
+    agenticpp::MemoryStore memory{agenticpp::Vectorizer{}, memory_config_from(config.value().memory,
+                                                                              false)};
+    memory.set_write_through(false);
+    const auto loaded = memory.load();
+    if (!loaded.has_value()) {
+        std::fprintf(stderr, "agentd: memory load warning: %s\n",
+                     loaded.error().message.c_str());
+        if (execute) {
+            return 2;
+        }
+    } else {
+        memory.set_write_through(execute);
+    }
+
+    std::vector<std::unique_ptr<agenticpp::Agent>> agents;
+    agents.reserve(workers);
+    for (std::size_t worker = 0; worker < workers; ++worker) {
+        agents.push_back(std::make_unique<agenticpp::Agent>(
+            config.value().agent, memory, *llms[worker], policy.value(), *runner, *verifier,
+            sink));
+    }
 
     agenticpp::LineBuffer buffer;
     buffer.append(std::span<const char>(data->data(), data->size()));
     buffer.flush_eof();
 
     std::size_t lines = 0;
-    while (const auto line = buffer.next_line()) {
-        ++lines;
-        agent.on_line(*line);
-        agent.run_once();
+    if (workers == 1) {
+        while (const auto line = buffer.next_line()) {
+            ++lines;
+            agents.front()->on_line(*line);
+            agents.front()->run_once();
+        }
+    } else {
+        const std::size_t capacity = std::max<std::size_t>(workers * 8, 32);
+        agenticpp::IncidentQueue queue(
+            workers, capacity,
+            [&agents](std::size_t worker, const std::string& line) {
+                agents[worker]->on_line(line);
+                agents[worker]->run_once();
+            });
+        while (const auto line = buffer.next_line()) {
+            ++lines;
+            if (!queue.submit(std::string{*line})) {
+                break;
+            }
+        }
+        queue.wait_idle();
+        queue.stop();
+    }
+
+    if (execute && loaded.has_value()) {
+        const auto compacted = memory.compact();
+        if (!compacted.has_value()) {
+            std::fprintf(stderr, "agentd: memory compact warning: %s\n",
+                         compacted.error().message.c_str());
+        }
     }
 
     if (stats) {
@@ -375,6 +476,7 @@ int main(int argc, char** argv) {
     std::vector<std::string> check_command;
     std::string llm_mode = "none";
     std::string cassette_path;
+    std::size_t workers = 0; // 0 means "use guards.max_concurrent_incidents"
 
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg = argv[i];
@@ -460,6 +562,22 @@ int main(int argc, char** argv) {
             llm_smoke = true;
             continue;
         }
+        if (arg == "--workers") {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "agentd: --workers requires a count\n");
+                return 2;
+            }
+            const char* text = argv[++i];
+            char* end = nullptr;
+            errno = 0;
+            const unsigned long long value = std::strtoull(text, &end, 10);
+            if (errno != 0 || end == text || *end != '\0' || value == 0) {
+                std::fprintf(stderr, "agentd: --workers must be a positive integer\n");
+                return 2;
+            }
+            workers = static_cast<std::size_t>(value);
+            continue;
+        }
         if (arg == "--seed-fix") {
             if (i + 2 >= argc) {
                 std::fprintf(stderr, "agentd: --seed-fix requires TEXT and PROGRAM\n");
@@ -533,7 +651,7 @@ int main(int argc, char** argv) {
     if (has_replay) {
         if (dry_run || execute) {
             return run_agent_replay(replay_path, config_path, execute, stats, llm_mode,
-                                    cassette_path);
+                                    cassette_path, workers);
         }
         return replay_file(replay_path, stats, dump_templates);
     }

@@ -5,18 +5,32 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>
 
 #include <fcntl.h>
 #include <poll.h>
+#include <sched.h>
 #include <signal.h>
+#include <sys/mount.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#include "agenticpp/unique_fd.hpp"
+
+#if AGENTICPP_HAVE_SECCOMP
+#include <seccomp.h>
+#endif
 
 namespace agenticpp {
 namespace {
@@ -83,6 +97,222 @@ int remaining_ms(Clock::time_point deadline) {
     return static_cast<int>(std::min<std::int64_t>(remaining.count(), kMaxPollMs));
 }
 
+namespace fs = std::filesystem;
+
+bool write_proc_text(const char* path, std::string_view text) {
+    UniqueFd fd{::open(path, O_WRONLY | O_CLOEXEC)};
+    if (!fd) {
+        return false;
+    }
+    std::size_t written = 0;
+    while (written < text.size()) {
+        const ssize_t count = ::write(fd.get(), text.data() + written, text.size() - written);
+        if (count > 0) {
+            written += static_cast<std::size_t>(count);
+            continue;
+        }
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+bool setup_namespaces(bool isolate_network) {
+    // Capture the host ids before unshare: after entering a fresh user
+    // namespace the process is temporarily mapped to the overflow id.
+    const uid_t uid = ::getuid();
+    const gid_t gid = ::getgid();
+
+    int flags = CLONE_NEWUSER | CLONE_NEWNS;
+    if (isolate_network) {
+        flags |= CLONE_NEWNET;
+    }
+    if (::unshare(flags) != 0) {
+        std::fprintf(stderr, "sandbox: unshare: %s\n", std::strerror(errno));
+        return false;
+    }
+
+    // setgroups may not exist on every kernel; failure here is non-fatal.
+    (void)write_proc_text("/proc/thread-self/setgroups", "deny");
+    if (!write_proc_text("/proc/thread-self/uid_map",
+                         "0 " + std::to_string(static_cast<unsigned long>(uid)) + " 1\n")) {
+        std::fprintf(stderr, "sandbox: uid_map: %s\n", std::strerror(errno));
+        return false;
+    }
+    if (!write_proc_text("/proc/thread-self/gid_map",
+                         "0 " + std::to_string(static_cast<unsigned long>(gid)) + " 1\n")) {
+        std::fprintf(stderr, "sandbox: gid_map: %s\n", std::strerror(errno));
+        return false;
+    }
+    if (::setresgid(0, 0, 0) != 0) {
+        std::fprintf(stderr, "sandbox: setresgid: %s\n", std::strerror(errno));
+        return false;
+    }
+    if (::setresuid(0, 0, 0) != 0) {
+        std::fprintf(stderr, "sandbox: setresuid: %s\n", std::strerror(errno));
+        return false;
+    }
+    return true;
+}
+
+bool bind_path(const fs::path& source, const fs::path& target, bool read_only) {
+    std::error_code error;
+    fs::create_directories(target, error);
+    if (error) {
+        return false;
+    }
+    if (::mount(source.c_str(), target.c_str(), nullptr, MS_BIND | MS_REC, nullptr) != 0) {
+        return false;
+    }
+    if (read_only &&
+        ::mount(nullptr, target.c_str(), nullptr, MS_REMOUNT | MS_BIND | MS_RDONLY, nullptr) !=
+            0) {
+        return false;
+    }
+    return true;
+}
+
+bool bind_if_present(const fs::path& source, const fs::path& target, bool read_only) {
+    std::error_code error;
+    if (!fs::exists(source, error)) {
+        return true;
+    }
+    return bind_path(source, target, read_only);
+}
+
+bool prepare_sandbox(const ExecutorConfig& config, const fs::path& root) {
+    if (config.sandbox_root.empty()) {
+        return false;
+    }
+    if (!setup_namespaces(config.sandbox_network)) {
+        return false;
+    }
+    if (::mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) != 0) {
+        return false;
+    }
+    if (::mount("tmpfs", root.c_str(), "tmpfs", MS_NOSUID | MS_NODEV, "mode=0755,size=64m") !=
+        0) {
+        return false;
+    }
+
+    const fs::path sandbox_tmp = root / "tmp";
+    std::error_code error;
+    fs::create_directories(sandbox_tmp, error);
+    if (error ||
+        ::mount("tmpfs", sandbox_tmp.c_str(), "tmpfs", MS_NOSUID | MS_NODEV,
+                "mode=1777,size=16m") != 0) {
+        return false;
+    }
+
+    // Host runtime directories are read-only inside the sandbox. /dev stays
+    // writable so scripts can use /dev/null; /tmp is a fresh tmpfs above.
+    for (const char* name : {"/bin", "/sbin", "/lib", "/lib64", "/usr", "/etc", "/nix",
+                             "/opt"}) {
+        if (!bind_if_present(name, root / fs::path{name}.relative_path(), true)) {
+            return false;
+        }
+    }
+    if (!bind_if_present("/dev", root / "dev", false)) {
+        return false;
+    }
+
+    const fs::path project = config.sandbox_root;
+    for (const fs::path& writable : config.sandbox_writable_paths) {
+        const fs::path source = writable.is_absolute() ? writable : project / writable;
+        fs::create_directories(source, error);
+        if (error) {
+            return false;
+        }
+    }
+
+    const fs::path project_target = root / project.relative_path();
+    if (!bind_path(project, project_target, true)) {
+        return false;
+    }
+    for (const fs::path& writable : config.sandbox_writable_paths) {
+        const fs::path source = writable.is_absolute() ? writable : project / writable;
+        const fs::path target =
+            writable.is_absolute() ? root / writable.relative_path() : project_target / writable;
+        if (!bind_path(source, target, false)) {
+            return false;
+        }
+    }
+
+    if (::chroot(root.c_str()) != 0 || ::chdir("/") != 0) {
+        return false;
+    }
+    return true;
+}
+
+bool install_seccomp() {
+#if AGENTICPP_HAVE_SECCOMP
+    scmp_filter_ctx context = ::seccomp_init(SCMP_ACT_ERRNO(EPERM));
+    if (context == nullptr) {
+        return false;
+    }
+
+    const char* allowed[] = {
+        "read", "write", "close", "lseek", "pread64", "pwrite64", "readv", "writev",
+        "fstat", "stat", "lstat", "newfstatat", "statx", "access", "faccessat",
+        "faccessat2", "openat", "openat2", "readlink", "readlinkat", "getdents64",
+        "mmap", "mprotect", "munmap", "brk", "madvise", "ioctl", "fcntl", "dup",
+        "dup2", "dup3", "pipe", "pipe2", "poll", "ppoll", "select", "pselect6",
+        "epoll_create1", "epoll_ctl", "epoll_wait", "epoll_pwait", "eventfd2",
+        "getpid", "getppid", "getuid", "geteuid", "getgid", "getegid", "gettid",
+        "getcwd", "chdir", "fchdir", "execve", "execveat", "exit", "exit_group",
+        "wait4", "waitid", "clone", "clone3", "fork", "vfork", "nanosleep",
+        "clock_nanosleep", "gettimeofday", "clock_gettime", "uname", "sched_yield",
+        "sched_getaffinity", "sched_setaffinity", "set_tid_address",
+        "set_robust_list", "futex", "prlimit64", "getrandom", "rseq", "arch_prctl",
+        "sigaltstack", "rt_sigaction", "rt_sigprocmask", "rt_sigreturn", "tgkill",
+        "kill", "umask", "mkdir", "mkdirat", "unlink", "unlinkat", "rename",
+        "renameat", "renameat2", "chmod", "fchmod", "fchmodat", "chown", "fchown",
+        "fchownat", "truncate", "ftruncate", "fsync", "fdatasync", "utimensat",
+        "memfd_create", "eventfd", "timerfd_create", "timerfd_settime", "prctl",
+    };
+
+    bool ok = true;
+    for (const char* name : allowed) {
+        const int number = ::seccomp_syscall_resolve_name(name);
+        if (number < 0) {
+            continue;
+        }
+        if (::seccomp_rule_add(context, SCMP_ACT_ALLOW, number, 0) != 0) {
+            ok = false;
+            break;
+        }
+    }
+    if (ok && ::seccomp_load(context) != 0) {
+        ok = false;
+    }
+    ::seccomp_release(context);
+    return ok;
+#else
+    return false;
+#endif
+}
+
+fs::path make_sandbox_root() {
+    std::string pattern = (fs::temp_directory_path() / "agenticpp-sandbox-XXXXXX").string();
+    std::vector<char> buffer(pattern.begin(), pattern.end());
+    buffer.push_back('\0');
+    char* created = ::mkdtemp(buffer.data());
+    if (created == nullptr) {
+        return {};
+    }
+    return fs::path{created};
+}
+
+void remove_sandbox_root(const fs::path& root) {
+    if (root.empty()) {
+        return;
+    }
+    std::error_code error;
+    fs::remove_all(root, error);
+}
+
 }  // namespace
 
 ExecResult DryRunRunner::run(const std::vector<std::string>& argv) {
@@ -106,6 +336,13 @@ ExecResult ChildProcessRunner::run(const std::vector<std::string>& argv) {
         return result;
     }
 
+    const fs::path sandbox_root = config_.sandbox_tier > 0 ? make_sandbox_root() : fs::path{};
+    if (config_.sandbox_tier > 0 && sandbox_root.empty()) {
+        result.exit_code = 127;
+        result.err = "cannot create sandbox root";
+        return result;
+    }
+
     std::vector<std::string> arguments = argv;
     std::vector<std::string> environment = build_environment(config_.env_allowlist);
     std::vector<char*> argv_ptrs = pointers(arguments);
@@ -120,6 +357,7 @@ ExecResult ChildProcessRunner::run(const std::vector<std::string>& argv) {
             ::close(out_pipe[0]);
             ::close(out_pipe[1]);
         }
+        remove_sandbox_root(sandbox_root);
         return result;
     }
 
@@ -132,6 +370,7 @@ ExecResult ChildProcessRunner::run(const std::vector<std::string>& argv) {
         ::close(out_pipe[1]);
         ::close(err_pipe[0]);
         ::close(err_pipe[1]);
+        remove_sandbox_root(sandbox_root);
         return result;
     }
 
@@ -145,6 +384,15 @@ ExecResult ChildProcessRunner::run(const std::vector<std::string>& argv) {
         ::close(out_pipe[1]);
         ::close(err_pipe[0]);
         ::close(err_pipe[1]);
+
+        if (config_.sandbox_tier > 0 && !prepare_sandbox(config_, sandbox_root)) {
+            std::fprintf(stderr, "sandbox: namespace setup failed\n");
+            ::_exit(126);
+        }
+        if (config_.sandbox_tier >= 2 && !install_seccomp()) {
+            std::fprintf(stderr, "sandbox: seccomp setup failed\n");
+            ::_exit(126);
+        }
 
         set_limit(RLIMIT_CPU, static_cast<rlim_t>(config_.limits.cpu_seconds));
         set_limit(RLIMIT_AS, static_cast<rlim_t>(config_.limits.address_space));
@@ -293,6 +541,7 @@ ExecResult ChildProcessRunner::run(const std::vector<std::string>& argv) {
     if (timed_out) {
         result.exit_code = -1;
     }
+    remove_sandbox_root(sandbox_root);
     return result;
 }
 

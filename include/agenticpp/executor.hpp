@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -15,6 +16,14 @@ struct ExecutorConfig {
     std::size_t output_cap = 64 * 1024;
     std::vector<std::string> env_allowlist{"PATH", "HOME", "LANG", "LC_ALL"};
     ExecLimits limits;
+
+    // Tier 0: policy + no shell + rlimits (the default).
+    // Tier 1: user/mount namespaces plus a chrooted tmpfs root.
+    // Tier 2: Tier 1 plus a seccomp syscall allowlist.
+    int sandbox_tier = 0;
+    bool sandbox_network = false;
+    std::filesystem::path sandbox_root;
+    std::vector<std::filesystem::path> sandbox_writable_paths{"data", "run"};
 };
 
 class CommandRunner {

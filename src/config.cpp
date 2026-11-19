@@ -55,7 +55,13 @@ Result<AppConfig> load_config(const std::filesystem::path& path) {
     if (json.contains("memory") && json["memory"].is_object()) {
         const auto& memory = json["memory"];
         config.memory.path = memory.value("path", config.memory.path);
+        config.memory.journal_path = memory.value("journal_path", config.memory.journal_path);
         config.memory.dim = memory.value("dim", config.memory.dim);
+        const int compact_after =
+            memory.value("compact_after_events", static_cast<int>(config.memory.compact_after_events));
+        if (compact_after >= 0) {
+            config.memory.compact_after_events = static_cast<std::size_t>(compact_after);
+        }
         const int top_k = memory.value("top_k", static_cast<int>(config.memory.top_k));
         if (top_k > 0) {
             config.memory.top_k = static_cast<std::size_t>(top_k);
@@ -136,6 +142,25 @@ Result<AppConfig> load_config(const std::filesystem::path& path) {
             for (const auto& item : executor["env_allowlist"]) {
                 if (item.is_string()) {
                     config.executor.env_allowlist.push_back(item.get<std::string>());
+                }
+            }
+        }
+        if (executor.contains("sandbox") && executor["sandbox"].is_object()) {
+            const auto& sandbox = executor["sandbox"];
+            const int tier = sandbox.value("tier", config.executor.sandbox_tier);
+            if (tier < 0) {
+                return Result<AppConfig>::err(5, "executor.sandbox.tier must be >= 0");
+            }
+            config.executor.sandbox_tier = tier;
+            config.executor.sandbox_network =
+                sandbox.value("network", config.executor.sandbox_network);
+            if (sandbox.contains("writable_paths") && sandbox["writable_paths"].is_array()) {
+                config.executor.sandbox_writable_paths.clear();
+                for (const auto& item : sandbox["writable_paths"]) {
+                    if (item.is_string()) {
+                        config.executor.sandbox_writable_paths.emplace_back(
+                            item.get<std::string>());
+                    }
                 }
             }
         }

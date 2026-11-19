@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -155,7 +156,10 @@ struct DeepSeekClient::Impl {
         if (const char* key = std::getenv(config.api_key_env.c_str()); key != nullptr) {
             api_key = key;
         }
-        (void)::curl_global_init(CURL_GLOBAL_DEFAULT);
+        // One process-wide libcurl initialisation. Calling global cleanup from
+        // each worker's client would invalidate the other clients' handles.
+        static std::once_flag curl_once;
+        std::call_once(curl_once, [] { (void)::curl_global_init(CURL_GLOBAL_DEFAULT); });
         curl = ::curl_easy_init();
     }
 
@@ -163,7 +167,6 @@ struct DeepSeekClient::Impl {
         if (curl != nullptr) {
             ::curl_easy_cleanup(curl);
         }
-        ::curl_global_cleanup();
     }
 
     Result<ChatReply> perform(const std::string& body, bool thinking, bool audit, int timeout_ms) {

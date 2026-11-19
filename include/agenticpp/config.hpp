@@ -20,8 +20,10 @@ struct LogSourceConfig {
 
 struct MemoryConfig {
     std::string path;
+    std::string journal_path;
     int dim = 512;
     std::size_t top_k = 3;
+    std::size_t compact_after_events = 1024;
     float recall_threshold = 0.86f;
 };
 

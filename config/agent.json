@@ -13,7 +13,9 @@
     "path": "data/memory.bin",
     "dim": 512,
     "top_k": 3,
-    "recall_threshold": 0.86
+    "recall_threshold": 0.86,
+    "journal_path": "data/memory.journal",
+    "compact_after_events": 1024
   },
   "llm": {
     "base_url": "https://api.deepseek.com/chat/completions",
@@ -55,6 +57,14 @@
       "address_space_bytes": 536870912,
       "nproc": 4096,
       "fsize_bytes": 1048576
+    },
+    "sandbox": {
+      "tier": 0,
+      "network": false,
+      "writable_paths": [
+        "data",
+        "run"
+      ]
     }
   },
   "verifier": {

@@ -2,6 +2,7 @@
 
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 
 #include "agenticpp/types.hpp"
 
@@ -20,6 +21,21 @@ public:
 
 private:
     std::ofstream output_;
+};
+
+// Serializes access to a sink shared by worker threads.
+class SynchronizedSink final : public EventSink {
+public:
+    explicit SynchronizedSink(EventSink& inner) : inner_(inner) {}
+
+    void emit(const Event& event) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        inner_.emit(event);
+    }
+
+private:
+    EventSink& inner_;
+    std::mutex mutex_;
 };
 
 class TeeSink final : public EventSink {

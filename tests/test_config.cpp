@@ -40,6 +40,11 @@ TEST_CASE("Config: loads the agent configuration") {
     REQUIRE(config.value().agent.recall_threshold == Catch::Approx(0.86f));
     REQUIRE(config.value().memory.dim == 512);
     REQUIRE(config.value().memory.top_k == 3);
+    REQUIRE(config.value().memory.journal_path == "data/memory.journal");
+    REQUIRE(config.value().memory.compact_after_events == 1024);
+    REQUIRE(config.value().executor.sandbox_tier == 0);
+    REQUIRE_FALSE(config.value().executor.sandbox_network);
+    REQUIRE(config.value().executor.sandbox_writable_paths.size() == 2);
 }
 
 TEST_CASE("Config: missing file is an error") {

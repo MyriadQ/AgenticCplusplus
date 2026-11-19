@@ -4,6 +4,8 @@ compile_commands.json
 data/logs/
 data/*.bin
 data/*.bin.tmp
+data/*.journal
+data/*.snapshot
 data/audit.log
 data/STOP
 run/

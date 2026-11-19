@@ -3,7 +3,9 @@
 
 #include <cstdint>
 #include <string>
+#include <thread>
 #include <utility>
+#include <vector>
 
 #include "agenticpp/memory_store.hpp"
 #include "agenticpp/template_parser.hpp"
@@ -164,4 +166,51 @@ TEST_CASE("MemoryStore: empty query returns no hits") {
                  make_record("free port 8080", "scripts/kill-decoy.sh"));
 
     REQUIRE(store.search("").empty());
+}
+
+TEST_CASE("MemoryStore: concurrent search and mutation stay consistent") {
+    agenticpp::MemoryStore store;
+    const std::string seed = "bind: address already in use";
+    const std::uint64_t seed_id = agenticpp::fnv1a64(seed);
+    REQUIRE(store.upsert(seed_id, seed,
+                         make_record("free port 8080", "scripts/kill-decoy.sh"))
+                .has_value());
+
+    std::vector<std::thread> threads;
+    for (int thread = 0; thread < 4; ++thread) {
+        threads.emplace_back([&store, thread, &seed] {
+            for (int i = 0; i < 50; ++i) {
+                const std::string text =
+                    "bind: address already in use worker=" + std::to_string(thread) +
+                    " iteration=" + std::to_string(i);
+                const std::uint64_t id = agenticpp::fnv1a64(text);
+                (void)store.upsert(id, text,
+                                   make_record("concurrent", "scripts/kill-decoy.sh"));
+                (void)store.record_outcome(id, true);
+                (void)store.search(seed, 3);
+                (void)store.size();
+            }
+        });
+    }
+    for (std::thread& thread : threads) {
+        thread.join();
+    }
+
+    REQUIRE(store.size() == 201);
+    REQUIRE(store.search(seed).front().template_id == seed_id);
+}
+
+TEST_CASE("MemoryStore: outcome counters break equal-score ties") {
+    const std::string text = "bind: address already in use";
+
+    agenticpp::MemoryStore store;
+    store.upsert(1, text, make_record("unreliable", "scripts/restart-victim.sh"));
+    store.upsert(2, text, make_record("reliable", "scripts/kill-decoy.sh"));
+    store.record_outcome(1, false);
+    store.record_outcome(2, true);
+
+    const auto hits = store.search(text, 2);
+    REQUIRE(hits.size() == 2);
+    REQUIRE(hits[0].template_id == 2);
+    REQUIRE(hits[1].template_id == 1);
 }

@@ -10,6 +10,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)          # for clangd / editors
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
+find_package(Threads REQUIRED)
+
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
 include(Warnings)
 
@@ -92,11 +94,36 @@ if(NOT AGENTICPP_ENABLE_LLM)
   list(FILTER AGENTICPP_SOURCES EXCLUDE REGEX ".*/deepseek_client\\.cpp$")
 endif()
 
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
+  set_source_files_properties(src/cosine_avx2.cpp PROPERTIES
+    COMPILE_OPTIONS "-mavx2;-mfma")
+  set(AGENTICPP_HAVE_AVX2 1)
+else()
+  list(FILTER AGENTICPP_SOURCES EXCLUDE REGEX ".*/cosine_avx2\\.cpp$")
+  set(AGENTICPP_HAVE_AVX2 0)
+endif()
+
+find_path(SECCOMP_INCLUDE_DIR seccomp.h)
+find_library(SECCOMP_LIBRARY seccomp)
+if(SECCOMP_INCLUDE_DIR AND SECCOMP_LIBRARY)
+  set(AGENTICPP_HAVE_SECCOMP 1)
+else()
+  set(AGENTICPP_HAVE_SECCOMP 0)
+endif()
+
 add_library(agenticpp_core STATIC ${AGENTICPP_SOURCES})
 target_include_directories(agenticpp_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(agenticpp_core PRIVATE agenticpp_warnings)
 target_link_libraries(agenticpp_core PUBLIC nlohmann_json::nlohmann_json)
+target_link_libraries(agenticpp_core PUBLIC Threads::Threads)
 target_compile_features(agenticpp_core PUBLIC cxx_std_20)
+target_compile_definitions(agenticpp_core PUBLIC
+  AGENTICPP_HAVE_AVX2=${AGENTICPP_HAVE_AVX2}
+  AGENTICPP_HAVE_SECCOMP=${AGENTICPP_HAVE_SECCOMP})
+if(AGENTICPP_HAVE_SECCOMP)
+  target_include_directories(agenticpp_core PRIVATE ${SECCOMP_INCLUDE_DIR})
+  target_link_libraries(agenticpp_core PRIVATE ${SECCOMP_LIBRARY})
+endif()
 
 if(AGENTICPP_ENABLE_LLM)
   target_compile_definitions(agenticpp_core PUBLIC AGENTICPP_ENABLE_LLM=1)
@@ -114,6 +141,9 @@ target_link_libraries(agentd PRIVATE agenticpp_core)
 
 add_executable(victim apps/victim.cpp)
 target_link_libraries(victim PRIVATE agenticpp_core)
+
+add_executable(bench_search apps/bench_search.cpp)
+target_link_libraries(bench_search PRIVATE agenticpp_core)
 # The executor confines children with RLIMIT_AS=512 MiB. ASan reserves a huge
 # virtual shadow range, so the demo victim must stay unsanitized. The agent and
 # core library remain ASan/UBSan builds.

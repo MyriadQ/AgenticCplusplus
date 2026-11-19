@@ -241,8 +241,19 @@ void Agent::run_incident(std::string_view line) {
     record.argv = argv;
     record.purpose = purpose;
     record.successes = 1;
+    if (recall_hit && hits.front().template_id == parsed.template_id &&
+        hits.front().record != nullptr) {
+        record.successes = hits.front().record->successes + 1;
+        record.failures = hits.front().record->failures;
+    }
     record.last_seen = std::chrono::system_clock::now();
-    memory_.upsert(parsed.template_id, parsed.template_text, std::move(record));
+    const Result<void> learned =
+        memory_.upsert(parsed.template_id, parsed.template_text, std::move(record));
+    if (!learned.has_value()) {
+        transition(Phase::Learn, Phase::Cooldown,
+                   "memory write failed: " + learned.error().message);
+        return;
+    }
 
     transition(Phase::Learn, Phase::Done, "stored fix for " + hex_id(parsed.template_id));
 }
