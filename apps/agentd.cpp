@@ -60,6 +60,7 @@ void print_usage(std::string_view argv0) {
         "  --llm-smoke               warm up the configured real LLM and exit\n"
         "  --workers N               process incidents with N bounded workers\n"
         "                            (default: guards.max_concurrent_incidents)\n"
+        "  --keep-memory-journal     do not compact the memory journal on exit\n"
         "  --seed-fix TEXT PROGRAM   seed an in-memory fix for a dev probe\n"
         "  --recall TEXT             query the in-memory store\n"
         "  --check-command ...       check an argv vector against the allowlist\n",
@@ -249,7 +250,7 @@ agenticpp::MemoryStoreConfig memory_config_from(const agenticpp::MemoryConfig& c
 
 int run_agent_replay(const std::string& replay_path, const std::string& config_path, bool execute,
                      bool stats, const std::string& llm_mode, const std::string& cassette_path,
-                     std::size_t workers) {
+                     std::size_t workers, bool compact_on_exit) {
     const auto data = read_file(replay_path);
     if (!data.has_value()) {
         std::fprintf(stderr, "agentd: cannot read '%s'\n", replay_path.c_str());
@@ -396,7 +397,7 @@ int run_agent_replay(const std::string& replay_path, const std::string& config_p
         queue.stop();
     }
 
-    if (execute && loaded.has_value()) {
+    if (execute && loaded.has_value() && compact_on_exit) {
         const auto compacted = memory.compact();
         if (!compacted.has_value()) {
             std::fprintf(stderr, "agentd: memory compact warning: %s\n",
@@ -477,6 +478,7 @@ int main(int argc, char** argv) {
     std::string llm_mode = "none";
     std::string cassette_path;
     std::size_t workers = 0; // 0 means "use guards.max_concurrent_incidents"
+    bool compact_on_exit = true;
 
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg = argv[i];
@@ -560,6 +562,10 @@ int main(int argc, char** argv) {
         }
         if (arg == "--llm-smoke") {
             llm_smoke = true;
+            continue;
+        }
+        if (arg == "--keep-memory-journal") {
+            compact_on_exit = false;
             continue;
         }
         if (arg == "--workers") {
@@ -651,7 +657,7 @@ int main(int argc, char** argv) {
     if (has_replay) {
         if (dry_run || execute) {
             return run_agent_replay(replay_path, config_path, execute, stats, llm_mode,
-                                    cassette_path, workers);
+                                    cassette_path, workers, compact_on_exit);
         }
         return replay_file(replay_path, stats, dump_templates);
     }

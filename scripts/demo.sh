@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # One failure mode: port conflict. Re-runnable; teardown by pidfile only.
+# KEEP_MEMORY=1 leaves data/memory.journal in place so a second terminal can
+# follow the incremental learned-fix records.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -10,6 +12,7 @@ RUN="${RUN_DIR:-$ROOT/run}"
 PORT="${VICTIM_PORT:-18080}"
 CASSETTE="${CASSETTE:-$ROOT/tests/data/port-conflict.reply.json}"
 CONFIG="${CONFIG:-$ROOT/config/agent.json}"
+KEEP_MEMORY="${KEEP_MEMORY:-0}"
 
 mkdir -p "$RUN" "$(dirname "$LOG")"
 
@@ -78,8 +81,13 @@ if ! grep -q "address already in use" "$LOG"; then
 fi
 echo "[demo] injected port conflict"
 
+AGENTD_EXTRA=()
+if [ "$KEEP_MEMORY" = "1" ]; then
+    AGENTD_EXTRA+=(--keep-memory-journal)
+fi
+
 "$AGENTD" --config "$CONFIG" --replay "$LOG" --execute --yes \
-    --llm=cassette "$CASSETTE" --stats
+    --llm=cassette "$CASSETTE" --stats "${AGENTD_EXTRA[@]}"
 
 if ! wait_health; then
     echo "[demo] FAIL: service did not recover" >&2
